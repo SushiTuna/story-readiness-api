@@ -1,68 +1,81 @@
-# IBM Hackathon GitHub Project Template
+# Story Readiness API
 
-This GitHub project template is for IBM Hackathon projects. It includes pre-configured security files to help prevent accidental credential commits and potential account suspension during the hackathon.
+Assess whether a Scrum user story is ready for sprint planning. Powered by [TypeSafe Jev](https://typesafe.ai).
 
-## 🚀 Quick Start
+## Prerequisites
 
-1. **Use this template to create your project:**
-   - Click "Use this template" button above and select "Create a new repository"
-   - Name your repository
-   - Click "Create repository"
+- [uv](https://docs.astral.sh/uv/) ≥ 0.4
+- Python 3.12 (managed automatically by uv)
+- A TypeSafe API key (set as `TYPESAFE_API_KEY`)
 
-2. **Clone your new repository:**
+## Setup
 
-   ```bash
-   git clone https://github.com/HACKATHON-ORG/your-repo-name.git
-   cd your-repo-name
-   ```
+```bash
+# 1. Clone and enter the project
+git clone <repo-url> && cd story-refinement
 
-3. **Set up environment variables:**
+# 2. Copy environment template
+cp .env.example .env
+# Edit .env and set TYPESAFE_API_KEY
 
-   ```bash
-   # Copy the example file
-   cp .env.example .env
+# 3. Install dependencies
+uv sync
+```
 
-   # Edit .env with your actual credentials
-   # Use your preferred editor (nano, vim, code, etc.)
-   nano .env
-   ```
+## Running
 
-4. **Verify .gitignore is working:**
+```bash
+PYTHONPATH=src uv run uvicorn app.main:app --reload
+```
 
-   ```bash
-   # This should NOT show .env file
-   git status
+API docs available at http://localhost:8000/docs
 
-   # This should confirm .env is ignored
-   git check-ignore -v .env
-   ```
+## Testing
 
-5. **Start developing!**
+```bash
+PYTHONPATH=src uv run pytest -v
+```
 
-## 🔒 Security Features
+## Environment Variables
 
-This template includes:
+| Variable | Required | Description |
+|---|---|---|
+| `TYPESAFE_API_KEY` | ✅ | TypeSafe API key for Jev model inference |
+| `JIRA_TOKEN` | Optional | Jira personal access token |
+| `JIRA_BASE_URL` | Optional | Jira instance base URL (e.g. `https://org.atlassian.net`) |
+| `LINEAR_TOKEN` | Optional | Linear personal API key |
 
-- **`.gitignore`** - Prevents committing credentials and live session files
-- **`.bobignore`** - Prevents AI assistants from logging credentials
-- **`.env.example`** - Template for your environment variables
+## API Overview
 
-## 📋 Before Every Commit
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/assess` | Assess a pasted story |
+| `GET` | `/api/sources` | List configured issue trackers |
+| `POST` | `/api/sources/{name}/assess` | Import and assess from Jira or Linear (stub) |
+| `GET` | `/health` | Health check |
 
-Always run this checklist:
+### Example: assess a story
 
-- [ ] Reviewed `git diff` for sensitive data
-- [ ] No hardcoded API keys or passwords
-- [ ] `.env` file is NOT in staged changes
-- [ ] No files with "credential" or "secret" in name
-- [ ] Used environment variables for all credentials
+```bash
+curl -X POST http://localhost:8000/api/assess \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Reject orders with quantity above 999",
+    "description": "As an API client developer, I want POST /api/orders to reject line items with quantity greater than 999 so that bulk orders go through the wholesale flow.",
+    "acceptance_criteria": "- Given quantity 1000, then the response is 400 QUANTITY_TOO_LARGE\n- Given quantity 999, then the order is accepted (201)",
+    "definition_of_ready": ["Security or privacy impact is described"]
+  }'
+```
 
-## 🆘 Need Help?
+### Verdict values
 
-- Read [SECURITY.md](SECURITY.MD) for detailed guidelines
-- Contact hackathon support through mentor channel
-- Ask in the hackathon Slack workspace
+| Verdict | Meaning |
+|---|---|
+| `ready` | Story passes all checks |
+| `discuss` | Some answers are uncertain — discuss in refinement |
+| `needs_refinement` | Weighted quality score below 0.6 |
+| `not_ready` | A blocking check failed confidently |
 
----
+## Weights & Thresholds
 
-**Remember:** Security is everyone's responsibility. When in doubt, ask for help!
+Default check weights live in `src/app/weights.py`. The quality threshold (0.6) and unsure band (0.35–0.65) are defined in `src/app/engine.py`. These are starting points — adjust to your team's Definition of Ready.

@@ -1,0 +1,26 @@
+[project]
+name = "story-refinement"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.141.1",
+    "python-dotenv>=1.2.3",
+    "typesafe-sdk>=0.7.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
+
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
