@@ -84,17 +84,27 @@ async def test_call_jev_returns_jev_response(monkeypatch: pytest.MonkeyPatch) ->
     assert result.answers == sdk_resp.answers
 
 
-def test_request_id_is_always_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """request_id is always None because the SDK does not expose it."""
-    # We can check the field without an async call via JevResponse directly.
-    resp = JevResponse(
-        model="jev-1.13.0",
-        request_id=None,
-        input_tokens=50,
-        latency_ms=42,
-        answers={},
-    )
-    assert resp.request_id is None
+async def test_request_id_extracted_from_sdk_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """request_id is read from resp.request_id on the SDK response object."""
+    sdk_resp = _make_sdk_response()
+    # Simulate the SDK attaching a request_id via its cached_property mechanism.
+    sdk_resp.__dict__["_request_id"] = "req_abc123"
+    monkeypatch.setattr("app.jev_client.get_client", lambda: _make_mock_client(sdk_resp))
+
+    result = await call_jev(state={"title": "T"}, questions={})
+
+    assert result.request_id == "req_abc123"
+
+
+async def test_request_id_is_none_when_sdk_header_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """request_id is None when the SDK response carries no x-typesafe-request-id header."""
+    sdk_resp = _make_sdk_response()
+    # No "_request_id" injected → cached_property raises TypeSafeError → we return None.
+    monkeypatch.setattr("app.jev_client.get_client", lambda: _make_mock_client(sdk_resp))
+
+    result = await call_jev(state={"title": "T"}, questions={})
+
+    assert result.request_id is None
 
 
 async def test_latency_ms_is_non_negative_int(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,3 +184,20 @@ async def test_input_tokens_none_when_sdk_returns_none(monkeypatch: pytest.Monke
     result = await call_jev(state={}, questions={})
 
     assert result.input_tokens is None
+
+
+async def test_get_client_error_inside_try_gives_jev_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug fix: get_client() is inside the try block so auth errors produce JevError, not 500."""
+    def bad_get_client():
+        raise ts.TypeSafeAuthenticationError(
+            status=401,
+            body={"error": "No API key"},
+            headers={},
+        )
+
+    monkeypatch.setattr("app.jev_client.get_client", bad_get_client)
+
+    with pytest.raises(JevError) as exc_info:
+        await call_jev(state={}, questions={})
+
+    assert exc_info.value.status_code == 401

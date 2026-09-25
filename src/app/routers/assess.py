@@ -1,6 +1,7 @@
 """POST /assess and POST /sources/{name}/assess routes."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Literal
 
@@ -10,6 +11,8 @@ from fastapi.responses import JSONResponse
 from app import engine
 from app.jev_client import JevError
 from app.schemas import AssessRequest, ErrorOut, ImportRequest, ReportOut
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["assess"])
 
@@ -43,7 +46,8 @@ async def assess_story(body: AssessRequest) -> ReportOut:
     try:
         return await engine.assess(body, source="paste")
     except JevError as exc:
-        raise HTTPException(status_code=502, detail=exc.detail) from exc
+        logger.error("Upstream TypeSafe error: %s", exc.detail)
+        raise HTTPException(status_code=502, detail="The assessment service is unavailable. Please try again later.") from exc
 
 
 @router.post(

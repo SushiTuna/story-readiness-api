@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 
 import typesafe_sdk as ts
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class JevResponse:
     model: str
-    request_id: str | None  # always None — SDK does not expose it; kept for ReportOut compatibility
+    request_id: str | None
     input_tokens: int | None
     latency_ms: int | None
     answers: dict[str, ts.NoulAnswer | ts.ChoiceAnswer | ts.ScoreAnswer]
@@ -51,18 +54,22 @@ async def call_jev(
     All SDK-level errors are caught and re-raised as :class:`JevError` so the
     route layer can return a ``502`` response.
     """
-    client = get_client()
     t0 = time.monotonic()
     try:
+        client = get_client()
         resp = await client.system_one(state=state, questions=questions)
     except ts.TypeSafeAPIError as exc:
         raise JevError(status_code=exc.status, detail=str(exc)) from exc
     except ts.TypeSafeError as exc:
         raise JevError(status_code=502, detail=str(exc)) from exc
     latency_ms = int((time.monotonic() - t0) * 1000)
+    try:
+        request_id: str | None = resp.request_id
+    except ts.TypeSafeError:
+        request_id = None
     return JevResponse(
         model=resp.model,
-        request_id=None,
+        request_id=request_id,
         input_tokens=resp.usage.input_tokens,
         latency_ms=latency_ms,
         answers=resp.answers,

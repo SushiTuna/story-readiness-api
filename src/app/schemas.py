@@ -45,8 +45,18 @@ class AssessRequest(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
     title: str = Field(min_length=1, max_length=500)
-    description: str = Field(default="", max_length=60000)
-    acceptance_criteria: str = Field(default="", max_length=60000)
+    # max_length is intentionally absent from these two fields so that oversized
+    # payloads reach the route handler and get a 413 (as the spec requires)
+    # rather than a Pydantic 422.  The OpenAPI schema still advertises maxLength
+    # via json_schema_extra so clients see the documented limit.
+    description: str = Field(
+        default="",
+        json_schema_extra={"maxLength": 60000},
+    )
+    acceptance_criteria: str = Field(
+        default="",
+        json_schema_extra={"maxLength": 60000},
+    )
     definition_of_ready: list[str] = Field(default_factory=list, max_length=50)
 
 

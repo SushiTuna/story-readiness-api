@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 
 import typesafe_sdk as ts
+
+logger = logging.getLogger(__name__)
 
 from app.jev_client import JevResponse, call_jev
 from app.schemas import (
@@ -86,7 +89,7 @@ CHECKS: list[CheckDef] = [
     CheckDef("ac_present",       "Acceptance criteria present",  CheckKind.blocker,  None),
     CheckDef("ac_quality",       "Acceptance criteria quality",  CheckKind.weighted, None),
     CheckDef("has_persona",      "User persona present",         CheckKind.blocker,  {"user_feature"}),
-    CheckDef("value_statement",  "Statement of value",           CheckKind.weighted, {"user_feature", "bug"}),
+    CheckDef("value_statement",  "Statement of value",           CheckKind.weighted, {"user_feature"}),
     CheckDef("failure_handling", "Failure & edge cases",         CheckKind.weighted, {"user_feature", "bug"}),
     CheckDef("safe_rollout",     "Safe rollout described",       CheckKind.weighted, {"technical"}),
     CheckDef("title_clarity",    "Title clarity",                CheckKind.weighted, None),
@@ -96,6 +99,18 @@ CHECKS: list[CheckDef] = [
 # Criteria lists for Score questions (used both when building questions and when mapping answers).
 _AC_QUALITY_CRITERIA    = ["No ACs", "Some ACs, not testable", "Clear and testable ACs"]
 _TITLE_CLARITY_CRITERIA = ["Vague", "Somewhat clear", "Clear and specific"]
+
+# Questions to surface to the author when a check fails or the model is unsure.
+_ASK: dict[str, list[str]] = {
+    "ac_present":      ["Please add acceptance criteria so the team can verify when this story is done."],
+    "ac_quality":      ["Can you rewrite the acceptance criteria in Given/When/Then or a similarly testable format?"],
+    "has_persona":     ["Who is the primary user or role that benefits from this story?"],
+    "value_statement": ["What business or user value does completing this story deliver?"],
+    "failure_handling":["What should happen when this feature fails or encounters an edge case?"],
+    "safe_rollout":    ["How will this change be rolled out safely — e.g. feature flag, migration plan, or rollback strategy?"],
+    "title_clarity":   ["Can you make the title more specific so it clearly conveys the change being made?"],
+    "scope_size":      ["This story may be too large to complete in a single sprint — can it be split?"],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +157,7 @@ async def assess(
             criteria=_TITLE_CLARITY_CRITERIA,
             instructions="Rate the clarity of the story title",
         ),
-        "scope_size": ts.Noul(instructions="Does this story appear oversized or should be split?"),
+        "scope_size": ts.Noul(instructions="Is this story appropriately sized and focused (not oversized)?"),
     }
     for i, item in enumerate(dor_items):
         questions[f"dor_{i}"] = ts.Noul(instructions=f"Is the following requirement met: {item}")
@@ -177,7 +192,7 @@ async def assess(
                 passed=ac_passed,
                 unsure=False,
                 answer={"present": int(ac_passed)},
-                ask=[],
+                ask=_ASK.get(chk.id, []) if not ac_passed else [],
             ))
             continue
 
@@ -209,7 +224,7 @@ async def assess(
             passed=passed,
             unsure=unsure,
             answer=answer,
-            ask=[],
+            ask=_ASK.get(chk.id, []) if (not passed or unsure) else [],
         ))
 
     # DoR checks
@@ -230,7 +245,7 @@ async def assess(
             passed=passed,
             unsure=unsure,
             answer={"yes": noul_val},
-            ask=[],
+            ask=[f"Please confirm: {item[:200]}"] if (not passed or unsure) else [],
         ))
 
     # 9. Compute quality (weighted average of all 'weighted' checks)
@@ -247,11 +262,15 @@ async def assess(
         quality = 0.0
 
     # 10. Determine verdict (first-match)
+    # flag checks are display-only — they must never influence the verdict.
     blockers_failed = [
         c.id for c in check_outs
         if c.kind == CheckKind.blocker and not c.passed and not c.unsure
     ]
-    to_discuss = [c.id for c in check_outs if c.unsure]
+    to_discuss = [
+        c.id for c in check_outs
+        if c.unsure and c.kind != CheckKind.flag
+    ]
 
     if blockers_failed:
         verdict = VerdictEnum.not_ready

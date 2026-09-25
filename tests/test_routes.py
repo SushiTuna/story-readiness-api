@@ -179,15 +179,47 @@ async def test_health(client):
 
 
 async def test_assess_jev_error_returns_502(client, monkeypatch):
-    """POST /api/assess with JevError raised → 502 with detail."""
+    """POST /api/assess with JevError raised → 502 with a generic (sanitized) message."""
     async def _raise_jev_error(*args, **kwargs):
-        raise JevError(status_code=502, detail="Upstream TypeSafe error")
+        raise JevError(
+            status_code=502,
+            detail="POST https://api.typesafe.ai/v1/system_one: 401 Unauthorized (request_id=req_abc)",
+        )
 
     monkeypatch.setattr("app.engine.assess", _raise_jev_error)
 
     resp = await client.post("/api/assess", json=_MINIMAL_ASSESS_BODY)
     assert resp.status_code == 502
-    assert resp.json()["detail"] == "Upstream TypeSafe error"
+    # The upstream URL and raw 401 message must NOT be exposed to the caller.
+    body = resp.json()
+    assert "typesafe.ai" not in body["detail"]
+    assert "401" not in body["detail"]
+    assert "req_abc" not in body["detail"]
+    assert len(body["detail"]) > 0  # still has a meaningful message
+
+
+async def test_oversized_description_returns_413(client, monkeypatch):
+    """Finding 5: a description exceeding 60 000 chars must return 413, not 422."""
+    monkeypatch.setattr("app.engine.assess", _async_make_report)
+
+    body = dict(_MINIMAL_ASSESS_BODY)
+    body["description"] = "x" * 60001
+
+    resp = await client.post("/api/assess", json=body)
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "The story is longer than the size limit."
+
+
+async def test_oversized_acceptance_criteria_returns_413(client, monkeypatch):
+    """Finding 5: an acceptance_criteria field exceeding 60 000 chars must return 413, not 422."""
+    monkeypatch.setattr("app.engine.assess", _async_make_report)
+
+    body = dict(_MINIMAL_ASSESS_BODY)
+    body["acceptance_criteria"] = "x" * 60001
+
+    resp = await client.post("/api/assess", json=body)
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "The story is longer than the size limit."
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,7 @@
+from dotenv import load_dotenv
+
+load_dotenv()  # load .env before any SDK/config reads
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
