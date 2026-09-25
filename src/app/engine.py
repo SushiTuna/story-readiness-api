@@ -140,11 +140,12 @@ async def assess(
     # 3. Build questions
     questions: dict[str, ts.Noul | ts.Choice | ts.Score] = {
         "story_type": ts.Choice(
+            instructions="What kind of work does the story (`title`, `description`, `acceptance_criteria`) describe?",
             criteria={
-                "user_feature": "Feature for a user",
-                "technical":    "Technical/infrastructure task",
-                "bug":          "Bug fix",
-            }
+                "user_feature": "New or changed behaviour that users, customers or API clients can see or use; the story delivers value directly to them.",
+                "technical":    "Internal engineering work that changes how the system is built or run rather than what its users can do, e.g. infrastructure, maintenance or developer tooling.",
+                "bug":          "Existing behaviour is broken or differs from what is expected; the story fixes a defect, crash or regression.",
+            },
         ),
         "ac_quality": ts.Score(
             criteria=_AC_QUALITY_CRITERIA,
