@@ -1,0 +1,466 @@
+openapi: 3.1.0
+info:
+  title: Story Readiness API
+  summary: Check whether a user story has enough information to start implementation.
+  description: 'Each story is judged by TypeSafe''s Jev model in one request. Code then applies blocking
+    rules, weights, and thresholds to reach a verdict. Checks depend on the story type: a persona is required
+    for user features only, a statement of value is not required for bugs, and technical stories are judged
+    on safe rollout instead of application edge cases.
+
+
+    Weights and thresholds are unvalidated starting points; see the README.'
+  version: 0.1.0
+paths:
+  /api/assess:
+    post:
+      tags:
+      - assess
+      summary: Assess a pasted story
+      operationId: assessStory
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssessRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportOut'
+        '413':
+          description: The story is longer than the size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '502':
+          description: The TypeSafe request failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/sources:
+    get:
+      tags:
+      - sources
+      summary: List issue trackers
+      operationId: listSources
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SourceOut'
+                type: array
+                title: Response Listsources
+  /api/sources/{name}/assess:
+    post:
+      tags:
+      - assess
+      - sources
+      summary: Import a story from a tracker and assess it
+      description: Jira and Linear fetching are stubs for now and return 501.
+      operationId: assessFromSource
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          enum:
+          - jira
+          - linear
+          type: string
+          title: Name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportOut'
+        '409':
+          description: The source's credentials are not configured on the server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '501':
+          description: Fetching from this source is not implemented yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '413':
+          description: The story is longer than the size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '502':
+          description: The TypeSafe request failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    AssessRequest:
+      properties:
+        title:
+          type: string
+          maxLength: 500
+          minLength: 1
+          title: Title
+          description: The story's title or summary.
+        description:
+          type: string
+          maxLength: 60000
+          title: Description
+          description: The story body. If `acceptance_criteria` is empty, a section under an 'Acceptance
+            criteria' heading here is moved into it.
+          default: ''
+        acceptance_criteria:
+          type: string
+          maxLength: 60000
+          title: Acceptance Criteria
+          description: One criterion per bullet, or Given/When/Then scenarios.
+          default: ''
+        definition_of_ready:
+          items:
+            type: string
+          type: array
+          maxItems: 50
+          title: Definition Of Ready
+          description: Extra requirements from the team's Definition of Ready, one per item. Each becomes
+            a yes/no check. Blank and duplicate items are dropped; at most 12 are used, each cut to 300
+            characters.
+      type: object
+      required:
+      - title
+      title: AssessRequest
+      examples:
+      - acceptance_criteria: '- Given quantity 1000, then the response is 400 QUANTITY_TOO_LARGE
+
+          - Given quantity 999, then the order is accepted (201)'
+        definition_of_ready:
+        - Security or privacy impact is described
+        description: As an API client developer, I want POST /api/orders to reject line items with quantity
+          greater than 999 so that bulk orders go through the wholesale flow.
+        title: Reject orders with quantity above 999
+    CheckOut:
+      properties:
+        id:
+          type: string
+          title: Id
+          description: Stable check id, e.g. `ac_present`, `has_persona`, `failure_handling`, or `dor_0`
+            for the first Definition of Ready item.
+        label:
+          type: string
+          title: Label
+          description: Human-readable name. May change with the story type.
+        kind:
+          type: string
+          enum:
+          - code
+          - blocker
+          - weighted
+          - flag
+          title: Kind
+          description: '`code` and `blocker`: a confident failure makes the story not ready. `weighted`:
+            counts towards `quality`. `flag`: shown only; never changes the verdict.'
+        value:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Value
+          description: 0 to 1; higher is better.
+        passed:
+          type: boolean
+          title: Passed
+        unsure:
+          type: boolean
+          title: Unsure
+          description: Jev's answer is too uncertain to call; discuss in refinement.
+        answer:
+          additionalProperties:
+            anyOf:
+            - type: number
+            - type: integer
+            - type: string
+          type: object
+          title: Answer
+          description: The raw judgment behind the check, for display and debugging. Keys vary by check,
+            e.g. `yes` (probability), `score`/`max`/`confidence`, `choice`, or `count`.
+        ask:
+          items:
+            type: string
+          type: array
+          title: Ask
+          description: Questions for the story's author when the check fails or is unsure.
+      type: object
+      required:
+      - id
+      - label
+      - kind
+      - value
+      - passed
+      - unsure
+      - answer
+      - ask
+      title: CheckOut
+    ErrorOut:
+      properties:
+        detail:
+          type: string
+          title: Detail
+      type: object
+      required:
+      - detail
+      title: ErrorOut
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    ImportRequest:
+      properties:
+        key:
+          type: string
+          maxLength: 100
+          minLength: 1
+          title: Key
+          description: Issue key, e.g. `PROJ-123` or `ENG-42`.
+        definition_of_ready:
+          items:
+            type: string
+          type: array
+          maxItems: 50
+          title: Definition Of Ready
+          description: Extra requirements from the team's Definition of Ready, one per item. Each becomes
+            a yes/no check. Blank and duplicate items are dropped; at most 12 are used, each cut to 300
+            characters.
+      type: object
+      required:
+      - key
+      title: ImportRequest
+      examples:
+      - definition_of_ready: []
+        key: PROJ-123
+    ReportOut:
+      properties:
+        verdict:
+          type: string
+          enum:
+          - ready
+          - discuss
+          - needs_refinement
+          - not_ready
+          title: Verdict
+          description: 'First match wins: `not_ready` (a blocker fails), `needs_refinement` (quality below
+            0.6), `discuss` (some answers are unsure), `ready`.'
+        quality:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Quality
+          description: Weighted average of the `weighted` checks.
+        checks:
+          items:
+            $ref: '#/components/schemas/CheckOut'
+          type: array
+          title: Checks
+        story:
+          $ref: '#/components/schemas/StoryOut'
+        story_type:
+          $ref: '#/components/schemas/StoryType'
+        blockers_failed:
+          items:
+            type: string
+          type: array
+          title: Blockers Failed
+          description: Ids of blocker checks that failed confidently.
+        to_discuss:
+          items:
+            type: string
+          type: array
+          title: To Discuss
+          description: Ids of checks whose answers were unsure.
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+          description: TypeSafe model that answered, e.g. `jev-1.13.0`.
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: TypeSafe request id, for support.
+        latency_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Latency Ms
+          description: Time spent waiting for TypeSafe.
+        input_tokens:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Input Tokens
+      type: object
+      required:
+      - verdict
+      - quality
+      - checks
+      - story
+      - story_type
+      - blockers_failed
+      - to_discuss
+      - model
+      - request_id
+      - latency_ms
+      - input_tokens
+      title: ReportOut
+    SourceOut:
+      properties:
+        name:
+          type: string
+          enum:
+          - jira
+          - linear
+          title: Name
+        configured:
+          type: boolean
+          title: Configured
+          description: True when the server has the credentials this source needs.
+      type: object
+      required:
+      - name
+      - configured
+      title: SourceOut
+    StoryOut:
+      properties:
+        title:
+          type: string
+          title: Title
+        description:
+          type: string
+          title: Description
+        acceptance_criteria:
+          type: string
+          title: Acceptance Criteria
+        key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Key
+          description: Issue key when imported from a tracker.
+        source:
+          type: string
+          enum:
+          - paste
+          - jira
+          - linear
+          title: Source
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Url
+          description: Link to the issue when imported from a tracker.
+      type: object
+      required:
+      - title
+      - description
+      - acceptance_criteria
+      - key
+      - source
+      - url
+      title: StoryOut
+      description: The story as judged, after acceptance criteria were split out of the description.
+    StoryType:
+      properties:
+        choice:
+          type: string
+          enum:
+          - user_feature
+          - technical
+          - bug
+          title: Choice
+          description: The most likely story type.
+        confidence:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Confidence
+        probabilities:
+          additionalProperties:
+            type: number
+          type: object
+          title: Probabilities
+          description: Probability of each story type.
+      type: object
+      required:
+      - choice
+      - confidence
+      - probabilities
+      title: StoryType
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+tags:
+- name: assess
+  description: Judge a story's readiness.
+- name: sources
+  description: Issue trackers that stories can be imported from.
