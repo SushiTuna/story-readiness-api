@@ -173,7 +173,7 @@ async def test_call_jev_passes_state_and_questions_to_sdk(monkeypatch: pytest.Mo
 
     await call_jev(state=state, questions=questions)
 
-    mock_client.system_one.assert_awaited_once_with(state=state, questions=questions)
+    mock_client.system_one.assert_awaited_once_with(state=state, questions=questions, model=None)
 
 
 async def test_input_tokens_none_when_sdk_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:

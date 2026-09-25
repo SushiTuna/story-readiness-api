@@ -48,16 +48,18 @@ def get_client() -> ts.AsyncTypeSafeClient:
 async def call_jev(
     state: dict,
     questions: dict[str, ts.Noul | ts.Choice | ts.Score],
+    model: str | None = None,
 ) -> JevResponse:
     """Call the Jev model with *state* and *questions* and return a ``JevResponse``.
 
+    Pass *model* to override the client default (e.g. ``"jev-latest"``).
     All SDK-level errors are caught and re-raised as :class:`JevError` so the
     route layer can return a ``502`` response.
     """
     t0 = time.monotonic()
     try:
         client = get_client()
-        resp = await client.system_one(state=state, questions=questions)
+        resp = await client.system_one(state=state, questions=questions, model=model)
     except ts.TypeSafeAPIError as exc:
         raise JevError(status_code=exc.status, detail=str(exc)) from exc
     except ts.TypeSafeError as exc:

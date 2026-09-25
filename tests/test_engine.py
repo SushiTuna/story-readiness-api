@@ -76,7 +76,7 @@ async def test_all_checks_pass_gives_ready(monkeypatch):
     """All checks pass → verdict 'ready'."""
     answers = _all_pass_answers("user_feature")
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -94,7 +94,7 @@ async def test_empty_ac_gives_not_ready(monkeypatch):
     """ac_present fails when acceptance_criteria is empty → not_ready."""
     answers = _all_pass_answers("user_feature")
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -111,7 +111,7 @@ async def test_value_statement_not_checked_for_bugs(monkeypatch):
     """Finding 4: value_statement must not appear in checks for bug stories (spec says not required)."""
     answers = _all_pass_answers("bug")
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -129,7 +129,7 @@ async def test_has_persona_fail_on_bug_is_not_blocker(monkeypatch):
     answers = _all_pass_answers("bug")
     answers["has_persona"] = _noul(0.1)  # confidently fails
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -149,7 +149,7 @@ async def test_has_persona_fail_on_user_feature_gives_not_ready(monkeypatch):
     answers = _all_pass_answers("user_feature")
     answers["has_persona"] = _noul(0.1)  # confidently fails, not unsure
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -172,7 +172,7 @@ async def test_low_quality_gives_needs_refinement(monkeypatch):
     answers["failure_handling"] = _noul(0.1)
     answers["title_clarity"] = _score(0, confidence=0.9)
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -190,7 +190,7 @@ async def test_unsure_answer_gives_discuss(monkeypatch):
     answers = _all_pass_answers("user_feature")
     answers["value_statement"] = _noul(0.5)  # exactly in unsure zone [0.35, 0.65]
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -212,7 +212,7 @@ async def test_dor_items_are_normalised(monkeypatch):
 
     seen_questions: dict = {}
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         seen_questions.update(questions)
         ans = _all_pass_answers("technical")
         # Add dor answers for whatever dor_N keys were sent
@@ -248,7 +248,7 @@ async def test_ac_extracted_from_description(monkeypatch):
 
     captured_state: dict = {}
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         captured_state.update(state)
         ans = _all_pass_answers("technical")
         return _jev_response(ans)
@@ -273,7 +273,7 @@ async def test_story_type_populated_from_jev(monkeypatch):
     answers = _all_pass_answers("technical")
     answers["story_type"] = _choice("technical", confidence=0.85)
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -292,7 +292,7 @@ async def test_flag_check_unsure_does_not_give_discuss(monkeypatch):
     # scope_size is a flag — noul=0.5 puts it in the unsure band
     answers["scope_size"] = _noul(0.5)
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -314,7 +314,7 @@ async def test_scope_size_value_not_inverted(monkeypatch):
     # Jev says story is well-sized (noul → "yes, appropriately sized") → high value
     answers["scope_size"] = _noul(0.95)
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -333,7 +333,7 @@ async def test_failing_check_has_ask_questions(monkeypatch):
     answers = _all_pass_answers("user_feature")
     answers["has_persona"] = _noul(0.1)  # confidently fails
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -353,7 +353,7 @@ async def test_unsure_check_has_ask_questions(monkeypatch):
     answers = _all_pass_answers("user_feature")
     answers["value_statement"] = _noul(0.5)  # in unsure band [0.35, 0.65]
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -371,7 +371,7 @@ async def test_passing_check_has_empty_ask(monkeypatch):
     """A check that passes confidently must have an empty ask list."""
     answers = _all_pass_answers("user_feature")
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -389,7 +389,7 @@ async def test_ac_present_failure_has_ask_question(monkeypatch):
     """ac_present failing must populate ask so the author knows what is needed."""
     answers = _all_pass_answers("user_feature")
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         return _jev_response(answers)
 
     monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
@@ -407,7 +407,7 @@ async def test_dor_failing_check_has_ask(monkeypatch):
     """A DoR check that fails must carry a confirmation question in ask."""
     dor_item = "The API contract must be reviewed by the team"
 
-    async def mock_call_jev(state, questions):
+    async def mock_call_jev(state, questions, **_):
         ans = _all_pass_answers("technical")
         ans["dor_0"] = _noul(0.1)  # fails
         return _jev_response(ans)

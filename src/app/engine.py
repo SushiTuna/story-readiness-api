@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 
@@ -149,21 +150,61 @@ async def assess(
             criteria=_AC_QUALITY_CRITERIA,
             instructions="Rate the acceptance criteria quality",
         ),
-        "has_persona": ts.Noul(instructions="Does the story identify a user persona or role?"),
-        "value_statement": ts.Noul(instructions="Does the story state the value or impact?"),
-        "failure_handling": ts.Noul(instructions="Are failure cases and edge cases addressed?"),
-        "safe_rollout": ts.Noul(instructions="Is rollout safety or migration described?"),
+        "has_persona": ts.Noul(
+            instructions="Do `title` or `description` name who the story is for?",
+            criteria={
+                "true":  "A specific user, role or client is named as the beneficiary, e.g. 'As a registered user', 'As an API client developer', 'admins'.",
+                "false": "No beneficiary is named, or only a vague 'we', 'the system' or 'someone'.",
+            },
+        ),
+        "value_statement": ts.Noul(
+            instructions="Does `description` say why the change matters?",
+            criteria={
+                "true":  "It states the benefit or outcome, e.g. a 'so that …' clause, a business reason, or the problem it removes.",
+                "false": "It only says what to build or what is broken, with no reason or benefit.",
+            },
+        ),
+        "failure_handling": ts.Noul(
+            instructions="Do `description` or `acceptance_criteria` cover what happens on failure, invalid input or boundary values?",
+            criteria={
+                "true":  "At least one error path, invalid input, limit or boundary case is specified with its expected result.",
+                "false": "Only the happy path is described, or failure behaviour is left unspecified.",
+            },
+        ),
+        "safe_rollout": ts.Noul(
+            instructions="Do `description` or `acceptance_criteria` explain how the change is released safely?",
+            criteria={
+                "true":  "A rollout or rollback mechanism is described, e.g. feature flag, dual writes, phased migration, backfill check, or rollback step.",
+                "false": "The change is described with no release, migration or rollback plan.",
+            },
+        ),
         "title_clarity": ts.Score(
             criteria=_TITLE_CLARITY_CRITERIA,
             instructions="Rate the clarity of the story title",
         ),
-        "scope_size": ts.Noul(instructions="Is this story appropriately sized and focused (not oversized)?"),
+        "scope_size": ts.Noul(
+            instructions="Is the story small enough for one team to finish within a single sprint?",
+            criteria={
+                "true":  "It describes one focused change or fix with a handful of acceptance criteria.",
+                "false": "It bundles several features, systems or deliverables that should be split into separate stories.",
+            },
+        ),
     }
     for i, item in enumerate(dor_items):
-        questions[f"dor_{i}"] = ts.Noul(instructions=f"Is the following requirement met: {item}")
+        questions[f"dor_{i}"] = ts.Noul(
+            instructions={
+                "requirement": item,
+                "question":    "Does the story (`title`, `description`, `acceptance_criteria`) satisfy `requirement`?",
+            },
+            criteria={
+                "true":  "The story text explicitly addresses the requirement.",
+                "false": "The story text does not mention or address the requirement.",
+            },
+        )
 
     # 4. Call Jev
-    jev: JevResponse = await call_jev(state, questions)
+    jev_model: str | None = os.getenv("TYPESAFE_MODEL") or None
+    jev: JevResponse = await call_jev(state, questions, model=jev_model)
 
     # 5. Extract story type
     story_type_ans: ts.ChoiceAnswer = jev.answers["story_type"]
