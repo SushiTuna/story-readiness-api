@@ -51,11 +51,11 @@ class AssessRequest(BaseModel):
     # via json_schema_extra so clients see the documented limit.
     description: str = Field(
         default="",
-        json_schema_extra={"maxLength": 60000},
+        json_schema_extra={"maxLength": 10000},
     )
     acceptance_criteria: str = Field(
         default="",
-        json_schema_extra={"maxLength": 60000},
+        json_schema_extra={"maxLength": 10000},
     )
     definition_of_ready: list[str] = Field(default_factory=list, max_length=50)
 

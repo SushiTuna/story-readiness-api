@@ -199,11 +199,11 @@ async def test_assess_jev_error_returns_502(client, monkeypatch):
 
 
 async def test_oversized_description_returns_413(client, monkeypatch):
-    """Finding 5: a description exceeding 60 000 chars must return 413, not 422."""
+    """Finding 5: a description exceeding 10 000 chars must return 413, not 422."""
     monkeypatch.setattr("app.engine.assess", _async_make_report)
 
     body = dict(_MINIMAL_ASSESS_BODY)
-    body["description"] = "x" * 60001
+    body["description"] = "x" * 10001
 
     resp = await client.post("/api/assess", json=body)
     assert resp.status_code == 413
@@ -211,11 +211,11 @@ async def test_oversized_description_returns_413(client, monkeypatch):
 
 
 async def test_oversized_acceptance_criteria_returns_413(client, monkeypatch):
-    """Finding 5: an acceptance_criteria field exceeding 60 000 chars must return 413, not 422."""
+    """Finding 5: an acceptance_criteria field exceeding 10 000 chars must return 413, not 422."""
     monkeypatch.setattr("app.engine.assess", _async_make_report)
 
     body = dict(_MINIMAL_ASSESS_BODY)
-    body["acceptance_criteria"] = "x" * 60001
+    body["acceptance_criteria"] = "x" * 10001
 
     resp = await client.post("/api/assess", json=body)
     assert resp.status_code == 413

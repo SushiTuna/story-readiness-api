@@ -38,7 +38,7 @@ def _linear_configured() -> bool:
     },
 )
 async def assess_story(body: AssessRequest) -> ReportOut:
-    if len(body.description) > 60000 or len(body.acceptance_criteria) > 60000:
+    if len(body.description) > 10000 or len(body.acceptance_criteria) > 10000:
         return JSONResponse(
             status_code=413,
             content=ErrorOut(detail="The story is longer than the size limit.").model_dump(),
