@@ -8,11 +8,13 @@ from fastapi.responses import JSONResponse
 
 from app.routers import assess as assess_router
 from app.routers import sources as sources_router
+from app.routers import webhooks as webhooks_router
 
 app = FastAPI(title="Story Readiness API", version="0.1.0")
 
 app.include_router(assess_router.router, prefix="/api")
 app.include_router(sources_router.router, prefix="/api")
+app.include_router(webhooks_router.router, prefix="/api")
 
 
 @app.exception_handler(RequestValidationError)

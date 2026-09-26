@@ -65,6 +65,7 @@ class ImportRequest(BaseModel):
 
     key: str = Field(min_length=1, max_length=100)
     definition_of_ready: list[str] = Field(default_factory=list, max_length=50)
+    post_comment: bool = False
 
 
 # ---------------------------------------------------------------------------

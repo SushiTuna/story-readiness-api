@@ -466,3 +466,39 @@ def test_normalise_dor_truncates_long_items():
     long_item = "x" * 500
     result = normalise_dor([long_item])
     assert len(result[0]) == 300
+
+
+@pytest.mark.asyncio
+async def test_labels_are_passed_as_story_type_hint(monkeypatch):
+    """Tracker labels reach Jev in the state and the story_type instructions mention them."""
+    captured: dict = {}
+
+    async def mock_call_jev(state, questions, **_):
+        captured["state"] = dict(state)
+        captured["story_type"] = questions["story_type"]
+        return _jev_response(_all_pass_answers("bug"))
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    await assess(_make_request(), source="linear", labels=["Bug", "Backend"])
+
+    assert captured["state"]["labels"] == "Bug, Backend"
+    assert "`labels`" in captured["story_type"].instructions
+
+
+@pytest.mark.asyncio
+async def test_paste_state_has_no_labels(monkeypatch):
+    """Without labels, the state and instructions are unchanged."""
+    captured: dict = {}
+
+    async def mock_call_jev(state, questions, **_):
+        captured["state"] = dict(state)
+        captured["story_type"] = questions["story_type"]
+        return _jev_response(_all_pass_answers("user_feature"))
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    await assess(_make_request(), source="paste")
+
+    assert "labels" not in captured["state"]
+    assert "`labels`" not in captured["story_type"].instructions

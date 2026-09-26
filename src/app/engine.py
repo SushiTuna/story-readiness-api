@@ -123,8 +123,13 @@ async def assess(
     source: str = "paste",
     key: str | None = None,
     url: str | None = None,
+    labels: list[str] | None = None,
 ) -> ReportOut:
-    """Run the full assessment pipeline and return a :class:`ReportOut`."""
+    """Run the full assessment pipeline and return a :class:`ReportOut`.
+
+    *labels* are tracker labels (e.g. Linear's ``Bug``), passed to Jev as a hint
+    for classifying the story type. Paste requests have none.
+    """
 
     # 1. Pre-process
     description, ac = extract_ac(request.description, request.acceptance_criteria)
@@ -136,11 +141,15 @@ async def assess(
         "description": description,
         "acceptance_criteria": ac,
     }
+    story_type_instructions = "What kind of work does the story (`title`, `description`, `acceptance_criteria`) describe?"
+    if labels:
+        state["labels"] = ", ".join(labels)
+        story_type_instructions += " `labels` are labels from the issue tracker; treat them as hints, e.g. a 'Bug' label suggests a defect fix."
 
     # 3. Build questions
     questions: dict[str, ts.Noul | ts.Choice | ts.Score] = {
         "story_type": ts.Choice(
-            instructions="What kind of work does the story (`title`, `description`, `acceptance_criteria`) describe?",
+            instructions=story_type_instructions,
             criteria={
                 "user_feature": "New or changed behaviour that users, customers or API clients can see or use; the story delivers value directly to them.",
                 "technical":    "Internal engineering work that changes how the system is built or run rather than what its users can do, e.g. infrastructure, maintenance or developer tooling.",

@@ -6,6 +6,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.main import app
 from app.jev_client import JevError
+from app.linear_client import LinearError, LinearIssue
 from app.schemas import (
     CheckKind,
     CheckOut,
@@ -30,9 +31,18 @@ _MINIMAL_ASSESS_BODY = {
 }
 
 _MINIMAL_IMPORT_BODY = {"key": "PROJ-123", "definition_of_ready": []}
+_LINEAR_IMPORT_BODY = {"key": "ENG-123", "definition_of_ready": []}
+
+_MOCK_LINEAR_ISSUE = LinearIssue(
+    id="uuid-123",
+    identifier="ENG-123",
+    title="Some Linear issue",
+    description="As a user I want something",
+    url="https://linear.app/eng/issue/ENG-123",
+)
 
 
-def _make_report() -> ReportOut:
+def _make_report(source: str = "paste", key: str | None = None, url: str | None = None) -> ReportOut:
     """Return a deterministic ReportOut for mocking."""
     return ReportOut(
         verdict=VerdictEnum.ready,
@@ -53,9 +63,9 @@ def _make_report() -> ReportOut:
             title="As a user I can log in",
             description="Some description",
             acceptance_criteria="Given I have an account, when I log in, then I see the dashboard",
-            key=None,
-            source=StorySource.paste,
-            url=None,
+            key=key,
+            source=StorySource(source),
+            url=url,
         ),
         story_type=StoryType(
             choice=StoryTypeChoice.user_feature,
@@ -163,12 +173,203 @@ async def test_assess_from_source_jira_creds_present(client, monkeypatch):
     assert resp.status_code == 501
 
 
-async def test_assess_from_source_linear_creds_present(client, monkeypatch):
-    """POST /api/sources/linear/assess → 501 when credentials ARE configured."""
+async def test_assess_from_source_linear_success(client, monkeypatch):
+    """POST /api/sources/linear/assess → 200 with source=linear, key, and url from the issue."""
     monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
 
-    resp = await client.post("/api/sources/linear/assess", json=_MINIMAL_IMPORT_BODY)
-    assert resp.status_code == 501
+    async def _mock_fetch_issue(key):
+        return _MOCK_LINEAR_ISSUE
+
+    async def _mock_assess(req, source="paste", key=None, url=None, labels=None):
+        return _make_report(source=source, key=key, url=url)
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch_issue)
+    monkeypatch.setattr("app.engine.assess", _mock_assess)
+
+    resp = await client.post("/api/sources/linear/assess", json=_LINEAR_IMPORT_BODY)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["story"]["source"] == "linear"
+    assert data["story"]["key"] == "ENG-123"
+    assert data["story"]["url"] == "https://linear.app/eng/issue/ENG-123"
+
+
+async def test_assess_from_source_linear_not_found(client, monkeypatch):
+    """POST /api/sources/linear/assess → 404 when fetch_issue raises not_found."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _mock_fetch_not_found(key):
+        raise LinearError("not_found", "no such issue")
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch_not_found)
+
+    resp = await client.post("/api/sources/linear/assess", json=_LINEAR_IMPORT_BODY)
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "The issue was not found in the source."
+
+
+async def test_assess_from_source_linear_upstream_error(client, monkeypatch):
+    """POST /api/sources/linear/assess → 502 with sanitized detail on upstream error."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _mock_fetch_upstream(key):
+        raise LinearError("upstream", "secret internal URL and tokens")
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch_upstream)
+
+    resp = await client.post("/api/sources/linear/assess", json=_LINEAR_IMPORT_BODY)
+    assert resp.status_code == 502
+    body = resp.json()
+    # Upstream detail must not leak
+    assert "secret" not in body["detail"]
+    assert len(body["detail"]) > 0
+
+
+async def test_assess_from_source_linear_rejected_token_returns_409(client, monkeypatch):
+    """POST /api/sources/linear/assess → 409 when Linear rejects the token (not 404/502)."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _mock_fetch_auth(key):
+        raise LinearError("auth", "Authentication failed (HTTP 401)")
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch_auth)
+
+    resp = await client.post("/api/sources/linear/assess", json=_LINEAR_IMPORT_BODY)
+    assert resp.status_code == 409
+    assert "rejected" in resp.json()["detail"]
+
+
+async def test_assess_from_source_linear_passes_label_hints(client, monkeypatch):
+    """Tracker labels reach the engine as hints; readiness:* labels do not."""
+    from app.linear_client import LinearLabel
+
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+    issue = LinearIssue(
+        id="uuid-123",
+        identifier="ENG-123",
+        title="Some Linear issue",
+        description="As a user I want something",
+        url="https://linear.app/eng/issue/ENG-123",
+        labels=[LinearLabel(id="l1", name="Bug"), LinearLabel(id="l2", name="readiness:ready")],
+    )
+    seen: dict = {}
+
+    async def _mock_fetch(key):
+        return issue
+
+    async def _mock_assess(req, source="paste", key=None, url=None, labels=None):
+        seen["labels"] = labels
+        return _make_report(source=source, key=key, url=url)
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch)
+    monkeypatch.setattr("app.engine.assess", _mock_assess)
+
+    resp = await client.post("/api/sources/linear/assess", json=_LINEAR_IMPORT_BODY)
+    assert resp.status_code == 200
+    assert seen["labels"] == ["Bug"]
+
+
+async def test_assess_from_source_linear_oversized_description(client, monkeypatch):
+    """POST /api/sources/linear/assess → 413 for oversized description, engine NOT called."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _mock_fetch_oversized(key):
+        return LinearIssue(
+            id="uuid-big",
+            identifier="ENG-BIG",
+            title="Big issue",
+            description="x" * 10001,
+            url="https://linear.app/eng/issue/ENG-BIG",
+        )
+
+    assess_called = []
+
+    async def _mock_assess(*args, **kwargs):
+        assess_called.append(True)
+        return _make_report()
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch_oversized)
+    monkeypatch.setattr("app.engine.assess", _mock_assess)
+
+    resp = await client.post("/api/sources/linear/assess", json=_LINEAR_IMPORT_BODY)
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "The story is longer than the size limit."
+    assert not assess_called
+
+
+async def test_assess_from_source_linear_post_comment_posted(client, monkeypatch):
+    """post_comment=true → 200 and X-Linear-Comment: posted."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _mock_fetch(key):
+        return _MOCK_LINEAR_ISSUE
+
+    async def _mock_assess(req, source="paste", key=None, url=None, labels=None):
+        return _make_report(source=source, key=key, url=url)
+
+    async def _mock_write(issue, report):
+        pass  # success
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch)
+    monkeypatch.setattr("app.engine.assess", _mock_assess)
+    monkeypatch.setattr("app.routers.assess.write_report_comment", _mock_write)
+
+    resp = await client.post(
+        "/api/sources/linear/assess",
+        json={**_LINEAR_IMPORT_BODY, "post_comment": True},
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("x-linear-comment") == "posted"
+
+
+async def test_assess_from_source_linear_comment_failure_still_200(client, monkeypatch):
+    """A comment failure does not fail the request; header is 'failed'."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _mock_fetch(key):
+        return _MOCK_LINEAR_ISSUE
+
+    async def _mock_assess(req, source="paste", key=None, url=None, labels=None):
+        return _make_report(source=source, key=key, url=url)
+
+    async def _mock_write_fail(issue, report):
+        raise LinearError("upstream", "network timeout")
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch)
+    monkeypatch.setattr("app.engine.assess", _mock_assess)
+    monkeypatch.setattr("app.routers.assess.write_report_comment", _mock_write_fail)
+
+    resp = await client.post(
+        "/api/sources/linear/assess",
+        json={**_LINEAR_IMPORT_BODY, "post_comment": True},
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("x-linear-comment") == "failed"
+
+
+async def test_assess_from_source_linear_no_comment_by_default(client, monkeypatch):
+    """Default request (post_comment omitted) → write_report_comment is not called."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _mock_fetch(key):
+        return _MOCK_LINEAR_ISSUE
+
+    async def _mock_assess(req, source="paste", key=None, url=None, labels=None):
+        return _make_report(source=source, key=key, url=url)
+
+    comment_called = []
+
+    async def _mock_write(issue, report):
+        comment_called.append(True)
+
+    monkeypatch.setattr("app.routers.assess.fetch_issue", _mock_fetch)
+    monkeypatch.setattr("app.engine.assess", _mock_assess)
+    monkeypatch.setattr("app.routers.assess.write_report_comment", _mock_write)
+
+    resp = await client.post("/api/sources/linear/assess", json=_LINEAR_IMPORT_BODY)
+    assert resp.status_code == 200
+    assert not comment_called
+    assert "x-linear-comment" not in resp.headers
 
 
 async def test_health(client):

@@ -70,7 +70,7 @@ paths:
       - assess
       - sources
       summary: Import a story from a tracker and assess it
-      description: Jira and Linear fetching are stubs for now and return 501.
+      description: Linear is implemented. Jira is still a stub and returns 501.
       operationId: assessFromSource
       parameters:
       - name: name
@@ -91,18 +91,26 @@ paths:
       responses:
         '200':
           description: Successful Response
+          headers:
+            X-Linear-Comment:
+              description: Present only when `post_comment` is true. `posted` if the comment was written successfully, `failed` if the comment request failed (the assessment is still returned).
+              schema:
+                type: string
+                enum:
+                - posted
+                - failed
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReportOut'
-        '409':
-          description: The source's credentials are not configured on the server.
+        '404':
+          description: The issue was not found in the source.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorOut'
-        '501':
-          description: Fetching from this source is not implemented yet.
+        '409':
+          description: The source's credentials are missing or were rejected.
           content:
             application/json:
               schema:
@@ -113,8 +121,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorOut'
+        '501':
+          description: Fetching from this source is not implemented yet (Jira).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
         '502':
-          description: The TypeSafe request failed.
+          description: The upstream service is unavailable.
           content:
             application/json:
               schema:
@@ -125,6 +139,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/webhooks/linear:
+    post:
+      tags:
+      - webhooks
+      summary: Receive a Linear Issue webhook
+      operationId: linearWebhook
+      description: Verifies the HMAC-SHA256 signature and the replay window, then schedules
+        processing of the issue. Returns 200 immediately so Linear does not retry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw Linear Issue webhook payload.
+      responses:
+        '200':
+          description: Accepted (processing happens asynchronously).
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: The signed payload is not a valid webhook body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '401':
+          description: Invalid or missing signature, or stale webhook timestamp.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '409':
+          description: LINEAR_WEBHOOK_SECRET is not configured on the server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
 components:
   schemas:
     AssessRequest:
@@ -137,14 +190,14 @@ components:
           description: The story's title or summary.
         description:
           type: string
-          maxLength: 60000
+          maxLength: 10000
           title: Description
           description: The story body. If `acceptance_criteria` is empty, a section under an 'Acceptance
             criteria' heading here is moved into it.
           default: ''
         acceptance_criteria:
           type: string
-          maxLength: 60000
+          maxLength: 10000
           title: Acceptance Criteria
           description: One criterion per bullet, or Given/When/Then scenarios.
           default: ''
@@ -266,13 +319,21 @@ components:
           description: Extra requirements from the team's Definition of Ready, one per item. Each becomes
             a yes/no check. Blank and duplicate items are dropped; at most 12 are used, each cut to 300
             characters.
+        post_comment:
+          type: boolean
+          title: Post Comment
+          description: When true, the verdict and follow-up questions are posted back to the issue as a
+            markdown comment. Opt-in because it writes to your workspace. Linear only; silently ignored
+            for other sources.
+          default: false
       type: object
       required:
       - key
       title: ImportRequest
       examples:
       - definition_of_ready: []
-        key: PROJ-123
+        key: ENG-123
+        post_comment: false
     ReportOut:
       properties:
         verdict:
@@ -464,3 +525,5 @@ tags:
   description: Judge a story's readiness.
 - name: sources
   description: Issue trackers that stories can be imported from.
+- name: webhooks
+  description: Inbound event hooks from issue trackers.
