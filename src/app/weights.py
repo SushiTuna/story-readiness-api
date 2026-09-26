@@ -8,6 +8,14 @@ WEIGHTS: dict[str, float] = {
     "safe_rollout":     1.0,
     "title_clarity":    0.5,
     "scope_size":       0.0,   # flag — excluded from quality
+    # AI-agent readiness: stories are mostly implemented by coding agents, so
+    # these weigh as much as the core checks (together about half the score).
+    # A confident failure of any of them also caps the verdict at
+    # needs_refinement (see engine.AGENT_CHECK_IDS).
+    "agent_no_open_decisions": 1.0,
+    "agent_verifiable":        1.0,
+    "agent_code_context":      1.0,
+    "agent_self_contained":    1.0,
     # dor_N items get weight DOR_WEIGHT each
 }
 

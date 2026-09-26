@@ -5,8 +5,16 @@ from __future__ import annotations
 import pytest
 import typesafe_sdk as ts
 
-from app.engine import assess, extract_ac, normalise_dor
-from app.schemas import AssessRequest
+from app.engine import AGENT_CHECK_IDS, CHECKS, assess, extract_ac, normalise_dor
+from app.schemas import AssessRequest, CheckKind
+from app.weights import WEIGHTS
+
+_AGENT_CHECKS = (
+    "agent_no_open_decisions",
+    "agent_verifiable",
+    "agent_code_context",
+    "agent_self_contained",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +58,7 @@ def _all_pass_answers(story_type: str = "user_feature") -> dict:
         "safe_rollout":     _noul(1.0),
         "title_clarity":    _score(2, confidence=0.9),    # max score → value=1.0
         "scope_size":       _noul(0.0),
+        **{check_id: _noul(1.0) for check_id in _AGENT_CHECKS},
     }
 
 
@@ -502,3 +511,131 @@ async def test_paste_state_has_no_labels(monkeypatch):
 
     assert "labels" not in captured["state"]
     assert "`labels`" not in captured["story_type"].instructions
+
+
+# ---------------------------------------------------------------------------
+# AI-agent readiness checks
+# ---------------------------------------------------------------------------
+
+def test_every_weighted_check_has_a_weight():
+    """A weighted check missing from WEIGHTS would silently fall back to DOR_WEIGHT."""
+    missing = [c.id for c in CHECKS if c.kind == CheckKind.weighted and c.id not in WEIGHTS]
+    assert missing == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("story_type", ["user_feature", "technical", "bug"])
+async def test_agent_checks_run_for_every_story_type(monkeypatch, story_type):
+    """The agent questions go to Jev and come back as weighted checks for all story types."""
+    sent: dict = {}
+
+    async def mock_call_jev(state, questions, **_):
+        sent.update(questions)
+        return _jev_response(_all_pass_answers(story_type))
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    report = await assess(_make_request(), source="paste")
+
+    checks = {c.id: c for c in report.checks}
+    for check_id in _AGENT_CHECKS:
+        assert check_id in sent
+        assert checks[check_id].kind == "weighted"
+        assert checks[check_id].label.startswith("Agent: ")
+
+
+@pytest.mark.asyncio
+async def test_all_agent_checks_failing_gives_needs_refinement(monkeypatch):
+    """All four failing on an otherwise perfect story: quality 4.0 / 8.0 < 0.6."""
+    answers = _all_pass_answers("user_feature")
+    for check_id in _AGENT_CHECKS:
+        answers[check_id] = _noul(0.0)
+
+    async def mock_call_jev(state, questions, **_):
+        return _jev_response(answers)
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    report = await assess(_make_request(), source="paste")
+
+    assert report.quality == pytest.approx(4.0 / 8.0, abs=1e-4)
+    assert report.verdict == "needs_refinement"
+    for check in report.checks:
+        if check.id in _AGENT_CHECKS:
+            assert check.passed is False
+            assert check.ask
+
+
+def test_agent_checks_weigh_like_core_checks():
+    assert AGENT_CHECK_IDS == set(_AGENT_CHECKS)
+    for check_id in _AGENT_CHECKS:
+        assert WEIGHTS[check_id] == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check_id", _AGENT_CHECKS)
+async def test_one_agent_check_failing_caps_at_needs_refinement(monkeypatch, check_id):
+    """A single confident failure keeps quality high (7.0 / 8.0) but the story is not ready for an agent."""
+    answers = _all_pass_answers("user_feature")
+    answers[check_id] = _noul(0.0)
+
+    async def mock_call_jev(state, questions, **_):
+        return _jev_response(answers)
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    report = await assess(_make_request(), source="paste")
+
+    assert report.quality == pytest.approx(7.0 / 8.0, abs=1e-4)
+    assert report.verdict == "needs_refinement"
+    failed = next(c for c in report.checks if c.id == check_id)
+    assert failed.ask
+
+
+@pytest.mark.asyncio
+async def test_agent_failure_outranks_discuss(monkeypatch):
+    """An unsure answer elsewhere would give discuss; the confident agent failure wins."""
+    answers = _all_pass_answers("user_feature")
+    answers["agent_no_open_decisions"] = _noul(0.1)
+    answers["value_statement"] = _noul(0.5)
+
+    async def mock_call_jev(state, questions, **_):
+        return _jev_response(answers)
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    report = await assess(_make_request(), source="paste")
+
+    assert report.verdict == "needs_refinement"
+
+
+@pytest.mark.asyncio
+async def test_blocker_failure_still_gives_not_ready_with_agent_failure(monkeypatch):
+    answers = _all_pass_answers("user_feature")
+    answers["has_persona"] = _noul(0.0)
+    answers["agent_self_contained"] = _noul(0.0)
+
+    async def mock_call_jev(state, questions, **_):
+        return _jev_response(answers)
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    report = await assess(_make_request(), source="paste")
+
+    assert report.verdict == "not_ready"
+
+
+@pytest.mark.asyncio
+async def test_unsure_agent_check_gives_discuss(monkeypatch):
+    answers = _all_pass_answers("technical")
+    answers["agent_code_context"] = _noul(0.5)
+
+    async def mock_call_jev(state, questions, **_):
+        return _jev_response(answers)
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+
+    report = await assess(_make_request(), source="paste")
+
+    assert report.verdict == "discuss"
+    assert "agent_code_context" in report.to_discuss

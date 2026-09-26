@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 import app.linear_client as lc
+from app import story_store
 
 
 def _refuse(request: httpx.Request) -> httpx.Response:
@@ -22,3 +23,19 @@ def isolated_linear_client(monkeypatch):
     client never leaks into the next test.
     """
     monkeypatch.setattr(lc, "_client", httpx.AsyncClient(transport=httpx.MockTransport(_refuse)))
+
+
+@pytest.fixture(autouse=True)
+def linear_enabled(monkeypatch):
+    """Switch the opt-in Linear integration on, so tests don't depend on LINEAR_ENABLED in .env.
+
+    Tests of the disabled integration set LINEAR_ENABLED themselves.
+    """
+    monkeypatch.setenv("LINEAR_ENABLED", "true")
+
+
+@pytest.fixture(autouse=True)
+def isolated_story_db(monkeypatch, tmp_path):
+    """Point the story store at a fresh SQLite file, so no test touches data/stories.db."""
+    monkeypatch.setenv("STORIES_DB_PATH", str(tmp_path / "stories.db"))
+    story_store.init_db()

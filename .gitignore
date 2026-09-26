@@ -118,3 +118,6 @@ build/
 # DO NOT REMOVE ABOVE PATTERNS
 # Add project-specific patterns below
 # ============================================
+
+# Story Readiness API: SQLite database for stored stories (STORIES_DB_PATH)
+data/

@@ -16,6 +16,8 @@ from app.linear_client import (
     ensure_label_group,
     fetch_issue,
     find_own_comment,
+    list_team_issues,
+    list_teams,
     format_report_comment,
     issue_fingerprint,
     parse_fingerprint,
@@ -779,6 +781,36 @@ def test_format_report_comment_failed_flag_is_a_note():
     assert "### Questions for the author" not in text
 
 
+def _agent_verifiable_check(*, unsure: bool) -> CheckOut:
+    return CheckOut(
+        id="agent_verifiable", label="Agent: verifiable done criteria", kind=CheckKind.weighted,
+        value=0.5 if unsure else 0.1, passed=False, unsure=unsure, answer={"yes": 0.1},
+        ask=["How can an AI coding agent check its own work?"],
+    )
+
+
+def test_format_report_comment_failed_agent_check_is_a_question():
+    """A confidently failed agent check asks the author, and is not a blocker."""
+    report = _make_report()
+    report.checks = [_agent_verifiable_check(unsure=False)]
+    report.blockers_failed = []
+    report.to_discuss = []
+    text = format_report_comment(report)
+    assert "### Questions for the author\n\n- How can an AI coding agent check its own work?" in text
+    assert "### Blockers failed" not in text
+    assert "### Items to discuss" not in text
+
+
+def test_format_report_comment_unsure_agent_check_is_discussed_by_label():
+    report = _make_report()
+    report.checks = [_agent_verifiable_check(unsure=True)]
+    report.blockers_failed = []
+    report.to_discuss = ["agent_verifiable"]
+    text = format_report_comment(report)
+    assert "### Items to discuss\n\n- Agent: verifiable done criteria" in text
+    assert "- How can an AI coding agent check its own work?" in text
+
+
 def test_format_report_comment_no_delta_without_previous():
     """A first assessment has no 'was' or 'Resolved' parts."""
     text = format_report_comment(_make_report())
@@ -799,3 +831,68 @@ def test_parse_fingerprint_missing_in_old_comment():
 def test_issue_fingerprint_changes_with_text():
     assert issue_fingerprint("a", "b") != issue_fingerprint("a", "c")
     assert issue_fingerprint("a", "b") == issue_fingerprint("a", "b")
+
+
+# ---------------------------------------------------------------------------
+# list_teams / list_team_issues
+# ---------------------------------------------------------------------------
+
+async def test_list_teams_parses_nodes(monkeypatch):
+    payload = {"data": {"teams": {"nodes": [{"id": "t1", "key": "CJD", "name": "Core"}]}}}
+    monkeypatch.setenv("LINEAR_TOKEN", "my_token")
+    lc._client = _make_mock_client(_json_transport(200, payload))
+
+    [team] = await list_teams()
+
+    assert (team.id, team.key, team.name) == ("t1", "CJD", "Core")
+
+
+async def test_list_team_issues_sends_filter_and_parses_issues(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        body = {"data": {"team": {"issues": {"nodes": [{
+            "id": "uuid-1",
+            "identifier": "CJD-4",
+            "title": "Export CSV",
+            "description": None,
+            "url": "https://linear.app/cjd/issue/CJD-4",
+            "team": {"id": "t1"},
+            "labels": {"nodes": [{"id": "l1", "name": "readiness:needs_refinement"}]},
+            "state": {"type": "started"},
+        }]}}}}
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setenv("LINEAR_TOKEN", "my_token")
+    lc._client = _make_mock_client(httpx.MockTransport(handler))
+
+    [issue] = await list_team_issues("t1", limit=25)
+
+    assert seen["variables"] == {"id": "t1", "first": 25}
+    assert 'nin: ["completed", "canceled"]' in seen["query"]
+    assert issue.identifier == "CJD-4"
+    assert issue.description == ""
+    assert issue.team_id == "t1"
+    assert issue.labels == [LinearLabel(id="l1", name="readiness:needs_refinement")]
+    assert issue.state_type == "started"
+
+
+async def test_list_team_issues_unknown_team_raises_not_found(monkeypatch):
+    body = {"data": None, "errors": [{"message": "Entity not found: Team", "extensions": {"code": "INPUT_ERROR"}}]}
+    monkeypatch.setenv("LINEAR_TOKEN", "my_token")
+    lc._client = _make_mock_client(_json_transport(200, body))
+
+    with pytest.raises(LinearError) as exc_info:
+        await list_team_issues("nope")
+    assert exc_info.value.kind == "not_found"
+
+
+async def test_list_team_issues_other_error_raises_upstream(monkeypatch):
+    body = {"data": None, "errors": [{"message": "Something broke"}]}
+    monkeypatch.setenv("LINEAR_TOKEN", "my_token")
+    lc._client = _make_mock_client(_json_transport(200, body))
+
+    with pytest.raises(LinearError) as exc_info:
+        await list_team_issues("t1")
+    assert exc_info.value.kind == "upstream"

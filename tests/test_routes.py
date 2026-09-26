@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.main import app
 from app.jev_client import JevError
-from app.linear_client import LinearError, LinearIssue
+from app.linear_client import LinearError, LinearIssue, LinearLabel, LinearTeam
 from app.schemas import (
     CheckKind,
     CheckOut,
@@ -429,3 +429,115 @@ async def test_oversized_acceptance_criteria_returns_413(client, monkeypatch):
 
 async def _async_make_report(*args, **kwargs) -> ReportOut:
     return _make_report()
+
+
+# ---------------------------------------------------------------------------
+# Linear listings for the board
+# ---------------------------------------------------------------------------
+
+async def test_list_linear_teams(client, monkeypatch):
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _teams():
+        return [LinearTeam(id="t1", key="CJD", name="Core")]
+
+    monkeypatch.setattr("app.routers.sources.list_teams", _teams)
+    resp = await client.get("/api/sources/linear/teams")
+    assert resp.status_code == 200
+    assert resp.json() == [{"id": "t1", "key": "CJD", "name": "Core"}]
+
+
+async def test_list_linear_issues_maps_readiness_label(client, monkeypatch):
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+    seen = {}
+
+    async def _issues(team_id):
+        seen["team"] = team_id
+        return [
+            LinearIssue(id="u1", identifier="CJD-4", title="Export CSV", description="d", url="https://x/CJD-4",
+                        state_type="started", labels=[LinearLabel(id="l1", name="Feature"), LinearLabel(id="l2", name="readiness:stale")]),
+            LinearIssue(id="u2", identifier="CJD-7", title="New", description="", url="https://x/CJD-7"),
+        ]
+
+    monkeypatch.setattr("app.routers.sources.list_team_issues", _issues)
+    resp = await client.get("/api/sources/linear/issues", params={"team": "t1"})
+    assert resp.status_code == 200
+    assert seen["team"] == "t1"
+    first, second = resp.json()
+    assert first["key"] == "CJD-4"
+    assert first["labels"] == ["Feature", "readiness:stale"]
+    assert first["readiness"] == "stale"
+    assert first["state_type"] == "started"
+    assert second["readiness"] is None
+
+
+async def test_list_linear_issues_requires_team(client, monkeypatch):
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+    resp = await client.get("/api/sources/linear/issues")
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("path", ["/api/sources/linear/teams", "/api/sources/linear/issues?team=t1"])
+async def test_linear_listings_without_token_are_409(client, monkeypatch, path):
+    monkeypatch.delenv("LINEAR_TOKEN", raising=False)
+    resp = await client.get(path)
+    assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# LINEAR_ENABLED: the integration is opt-in
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [None, "", "false", "0", "no"])
+async def test_linear_is_off_unless_enabled(client, monkeypatch, value):
+    """A token alone does not turn Linear on: /api/sources reports it as not configured."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+    if value is None:
+        monkeypatch.delenv("LINEAR_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("LINEAR_ENABLED", value)
+
+    resp = await client.get("/api/sources")
+    assert {s["name"]: s["configured"] for s in resp.json()}["linear"] is False
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", " 1 ", "yes", "on"])
+async def test_linear_enabled_values(client, monkeypatch, value):
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+    monkeypatch.setenv("LINEAR_ENABLED", value)
+
+    resp = await client.get("/api/sources")
+    assert {s["name"]: s["configured"] for s in resp.json()}["linear"] is True
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("GET", "/api/sources/linear/teams", None),
+        ("GET", "/api/sources/linear/issues?team=t1", None),
+        ("POST", "/api/sources/linear/assess", _LINEAR_IMPORT_BODY),
+    ],
+)
+async def test_disabled_linear_endpoints_are_409_without_calling_linear(client, monkeypatch, method, path, body):
+    """With LINEAR_ENABLED off, nothing reaches Linear (conftest makes any Linear call raise)."""
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+    monkeypatch.setenv("LINEAR_ENABLED", "false")
+
+    resp = await client.request(method, path, json=body)
+    assert resp.status_code == 409
+    assert "disabled" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "status"), [("auth", 409), ("upstream", 502), ("not_found", 404)]
+)
+async def test_list_linear_issues_maps_linear_errors(client, monkeypatch, kind, status):
+    monkeypatch.setenv("LINEAR_TOKEN", "lin_tok")
+
+    async def _fail(team_id):
+        raise LinearError(kind, "boom")
+
+    monkeypatch.setattr("app.routers.sources.list_team_issues", _fail)
+    resp = await client.get("/api/sources/linear/issues", params={"team": "t1"})
+    assert resp.status_code == status
+    assert resp.json()["detail"]

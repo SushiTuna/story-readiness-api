@@ -95,7 +95,17 @@ CHECKS: list[CheckDef] = [
     CheckDef("safe_rollout",     "Safe rollout described",       CheckKind.weighted, {"technical"}),
     CheckDef("title_clarity",    "Title clarity",                CheckKind.weighted, None),
     CheckDef("scope_size",       "Scope / story size",           CheckKind.flag,     None),
+    # AI-agent readiness: can a coding agent (Claude Code, Copilot, Codex, Bob…)
+    # implement the story without asking anyone? See README "AI-agent readiness checks".
+    CheckDef("agent_no_open_decisions", "Agent: no open decisions",        CheckKind.weighted, None),
+    CheckDef("agent_verifiable",        "Agent: verifiable done criteria", CheckKind.weighted, None),
+    CheckDef("agent_code_context",      "Agent: code location named",      CheckKind.weighted, None),
+    CheckDef("agent_self_contained",    "Agent: no human-only steps",      CheckKind.weighted, None),
 ]
+
+# A confident failure of any of these means an agent could not implement the story
+# without asking someone, so the story is at most needs_refinement, whatever its score.
+AGENT_CHECK_IDS: frozenset[str] = frozenset(c.id for c in CHECKS if c.id.startswith("agent_"))
 
 # Criteria lists for Score questions (used both when building questions and when mapping answers).
 _AC_QUALITY_CRITERIA    = ["No ACs", "Some ACs, not testable", "Clear and testable ACs"]
@@ -111,6 +121,10 @@ _ASK: dict[str, list[str]] = {
     "safe_rollout":    ["How will this change be rolled out safely — e.g. feature flag, migration plan, or rollback strategy?"],
     "title_clarity":   ["Can you make the title more specific so it clearly conveys the change being made?"],
     "scope_size":      ["This story may be too large to complete in a single sprint — can it be split?"],
+    "agent_no_open_decisions": ["Which open decisions (TBDs, alternatives, unspecified rules) must be settled before an AI coding agent can implement this without asking?"],
+    "agent_verifiable":        ["How can an AI coding agent check its own work — which tests, example inputs and expected outputs, or commands should pass?"],
+    "agent_code_context":      ["Which files, modules or existing patterns should the change follow?"],
+    "agent_self_contained":    ["Which steps need a person (access, credentials, approvals, missing designs), and can they be done before the story goes to an agent?"],
 }
 
 
@@ -197,6 +211,34 @@ async def assess(
             criteria={
                 "true":  "It describes one focused change or fix with a handful of acceptance criteria.",
                 "false": "It bundles several features, systems or deliverables that should be split into separate stories.",
+            },
+        ),
+        "agent_no_open_decisions": ts.Noul(
+            instructions="Could an AI coding agent that cannot ask anyone implement the story (`title`, `description`, `acceptance_criteria`) as written?",
+            criteria={
+                "true":  "The expected behaviour and rules are specified; there are no TBDs, open questions, or alternatives left to choose between.",
+                "false": "Product or design decisions are left open, e.g. 'TBD', 'option A or B', 'to be discussed', or unspecified business rules.",
+            },
+        ),
+        "agent_verifiable": ts.Noul(
+            instructions="Do `description` or `acceptance_criteria` say how to check automatically that the work is done?",
+            criteria={
+                "true":  "They name tests to add or pass, example inputs with expected outputs, a command to run, or measurable results.",
+                "false": "Done can only be judged by a person looking at the result, or is not stated.",
+            },
+        ),
+        "agent_code_context": ts.Noul(
+            instructions="Do `title`, `description` or `acceptance_criteria` point to where in the code the change belongs?",
+            criteria={
+                "true":  "They name files, modules, services, endpoints or components, or an existing pattern to follow; for a defect, the error message or reproduction steps.",
+                "false": "Nothing indicates where in the codebase to start.",
+            },
+        ),
+        "agent_self_contained": ts.Noul(
+            instructions="Can the story be completed by changing the code repository alone?",
+            criteria={
+                "true":  "No step needs production access, credentials, manual changes in external consoles, approvals, or designs that do not exist yet.",
+                "false": "It depends on such a step, e.g. a manual production change, a vendor decision, access a developer must request, or a missing design.",
             },
         ),
     }
@@ -322,10 +364,14 @@ async def assess(
         c.id for c in check_outs
         if c.unsure and c.kind != CheckKind.flag
     ]
+    agent_failed = [
+        c.id for c in check_outs
+        if c.id in AGENT_CHECK_IDS and not c.passed and not c.unsure
+    ]
 
     if blockers_failed:
         verdict = VerdictEnum.not_ready
-    elif quality < 0.6:
+    elif quality < 0.6 or agent_failed:
         verdict = VerdictEnum.needs_refinement
     elif to_discuss:
         verdict = VerdictEnum.discuss

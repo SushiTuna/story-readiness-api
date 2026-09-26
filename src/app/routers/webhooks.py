@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 
 from app.linear_webhook import _is_duplicate, is_fresh, process_issue, verify_signature
+from app.routers.errors import linear_disabled, linear_enabled
 from app.schemas import ErrorOut
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,10 @@ def _bad_payload() -> JSONResponse:
         200: {"description": "Accepted (processing happens asynchronously)."},
         400: {"model": ErrorOut, "description": "The signed payload is not a valid webhook body."},
         401: {"model": ErrorOut, "description": "Invalid or missing signature, or stale webhook timestamp."},
-        409: {"model": ErrorOut, "description": "LINEAR_WEBHOOK_SECRET is not configured on the server."},
+        409: {
+            "model": ErrorOut,
+            "description": "The Linear integration is disabled, or LINEAR_WEBHOOK_SECRET is not configured on the server.",
+        },
     },
     status_code=200,
 )
@@ -69,6 +73,10 @@ async def linear_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> JSONResponse:
+    if not linear_enabled():
+        logger.warning("Webhook: the Linear integration is disabled (LINEAR_ENABLED) — rejecting webhook")
+        return linear_disabled()
+
     secret = os.getenv("LINEAR_WEBHOOK_SECRET", "")
     if not secret:
         logger.warning("LINEAR_WEBHOOK_SECRET is not set — rejecting webhook")

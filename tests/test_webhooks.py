@@ -136,6 +136,27 @@ def reset_seen_cache():
 # Receiver route — signature and timestamp checks
 # ---------------------------------------------------------------------------
 
+async def test_webhook_disabled_returns_409_and_schedules_nothing(client, monkeypatch):
+    """LINEAR_ENABLED off → 409 even for a correctly signed delivery; the issue is not processed."""
+    monkeypatch.setenv("LINEAR_ENABLED", "false")
+    monkeypatch.setenv("LINEAR_WEBHOOK_SECRET", _SECRET)
+    called = []
+
+    async def fake_process(issue_id):
+        called.append(issue_id)
+
+    monkeypatch.setattr("app.routers.webhooks.process_issue", fake_process)
+    body = json.dumps(_make_payload()).encode()
+    resp = await client.post(
+        "/api/webhooks/linear",
+        content=body,
+        headers={"Content-Type": "application/json", "Linear-Signature": _sign(body)},
+    )
+    assert resp.status_code == 409
+    assert "disabled" in resp.json()["detail"]
+    assert called == []
+
+
 async def test_webhook_no_secret_returns_409(client, monkeypatch):
     """Missing LINEAR_WEBHOOK_SECRET → 409."""
     monkeypatch.delenv("LINEAR_WEBHOOK_SECRET", raising=False)

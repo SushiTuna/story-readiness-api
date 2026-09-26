@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import enum
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +30,16 @@ class CheckKind(str, enum.Enum):
     blocker = "blocker"
     weighted = "weighted"
     flag = "flag"
+
+
+class StoryStatus(str, enum.Enum):
+    """Workflow column of a stored story on the board."""
+    backlog = "backlog"
+    refinement = "refinement"
+    ready_for_sprint = "ready_for_sprint"
+    in_sprint = "in_sprint"
+    done = "done"
+    blocked = "blocked"
 
 
 class VerdictEnum(str, enum.Enum):
@@ -127,3 +139,123 @@ class SourceOut(BaseModel):
 
 class ErrorOut(BaseModel):
     detail: str
+
+
+# ---------------------------------------------------------------------------
+# Boards
+# ---------------------------------------------------------------------------
+
+class BoardUpdateIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+
+
+class BoardIn(BoardUpdateIn):
+    key_prefix: str = Field(
+        min_length=2,
+        max_length=6,
+        pattern=r"^[A-Z][A-Z0-9]+$",
+        description="Prefix of the board's story keys, e.g. FLW for FLW-1. Uppercase letters and digits, starting "
+        "with a letter. Unique among boards and fixed once the board is created.",
+    )
+
+
+class BoardOut(BaseModel):
+    id: str
+    name: str
+    description: str
+    key_prefix: str
+    created_at: datetime
+    story_count: int = Field(description="Stories on the board, in every column.")
+    story_limit: int = Field(description="The most stories the board can hold.")
+
+
+# ---------------------------------------------------------------------------
+# Stored stories
+# ---------------------------------------------------------------------------
+
+class StoryIn(AssessRequest):
+    """A story to store. Same fields and limits as AssessRequest."""
+
+
+class StoryMoveIn(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    status: StoryStatus
+    position: float = Field(description="Order within the column, ascending. The client picks a value between the neighbours.")
+    blocked_reason: str | None = Field(
+        None,
+        max_length=500,
+        description="Why the story is blocked. Required when status is blocked; not allowed otherwise.",
+    )
+
+    @model_validator(mode="after")
+    def _reason_only_when_blocked(self) -> StoryMoveIn:
+        # PydanticCustomError (not ValueError) keeps the 422 body JSON-serialisable in main's handler.
+        reason = self.blocked_reason.strip() if self.blocked_reason is not None else None
+        if self.status == StoryStatus.blocked.value and not reason:
+            raise PydanticCustomError("blocked_reason_missing", "A blocked story needs a blocked_reason.")
+        if self.status != StoryStatus.blocked.value and reason is not None:
+            raise PydanticCustomError("blocked_reason_not_allowed", "blocked_reason is only allowed when status is blocked.")
+        self.blocked_reason = reason
+        return self
+
+
+class AssessmentSummaryOut(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    verdict: VerdictEnum
+    quality: float = Field(ge=0.0, le=1.0)
+    question_count: int = Field(description="Questions for the author in this assessment.")
+    created_at: datetime
+
+
+class StoredStoryOut(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id: str
+    board_id: str
+    key: str = Field(
+        description="Short, human-readable key: the board's prefix and a number, e.g. FLW-12. Never reused after a delete."
+    )
+    title: str
+    description: str
+    acceptance_criteria: str
+    definition_of_ready: list[str]
+    created_at: datetime
+    updated_at: datetime
+    status: StoryStatus
+    position: float
+    blocked_reason: str | None = Field(description="Why the story is blocked; set only in the blocked column.")
+    latest: AssessmentSummaryOut | None = Field(description="The latest assessment, or null if never assessed.")
+    previous_quality: float | None = Field(description="Quality of the assessment before the latest one.")
+    stale: bool = Field(description="The story was edited after its latest assessment.")
+
+
+class StoredStoryDetailOut(StoredStoryOut):
+    report: ReportOut | None = Field(description="Full report of the latest assessment.")
+    history: list[AssessmentSummaryOut] = Field(description="All assessments, newest first.")
+
+
+# ---------------------------------------------------------------------------
+# Linear listing
+# ---------------------------------------------------------------------------
+
+class LinearTeamOut(BaseModel):
+    id: str
+    key: str
+    name: str
+
+
+class IssueCardOut(BaseModel):
+    key: str
+    title: str
+    description: str
+    url: str
+    labels: list[str]
+    state_type: str = Field(description="Linear workflow state type, e.g. `backlog`, `unstarted` or `started`.")
+    readiness: str | None = Field(
+        description="Suffix of the issue's readiness:* label, e.g. `ready`, `stale` or `error`; null if none.",
+    )

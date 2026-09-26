@@ -110,7 +110,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorOut'
         '409':
-          description: The source's credentials are missing or were rejected.
+          description: The source is disabled, or its credentials are missing or were rejected.
           content:
             application/json:
               schema:
@@ -129,6 +129,471 @@ paths:
                 $ref: '#/components/schemas/ErrorOut'
         '502':
           description: The upstream service is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/sources/linear/teams:
+    get:
+      tags:
+      - sources
+      summary: List the Linear teams the token can see
+      operationId: listLinearTeams
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/LinearTeamOut'
+                type: array
+                title: Response Listlinearteams
+        '409':
+          description: The source is disabled, or its credentials are missing or were rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '502':
+          description: The upstream service is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+  /api/sources/linear/issues:
+    get:
+      tags:
+      - sources
+      summary: List a Linear team's open issues
+      description: Read-only. Returns up to 100 issues that are not completed or canceled, most recently
+        updated first.
+      operationId: listLinearIssues
+      parameters:
+      - name: team
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Linear team id, from /sources/linear/teams.
+          title: Team
+        description: Linear team id, from /sources/linear/teams.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IssueCardOut'
+                title: Response Listlinearissues
+        '404':
+          description: The team was not found in the source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '409':
+          description: The source is disabled, or its credentials are missing or were rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '502':
+          description: The upstream service is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/boards:
+    get:
+      tags:
+      - boards
+      summary: List boards with their story counts
+      operationId: listBoards
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/BoardOut'
+                type: array
+                title: Response Listboards
+    post:
+      tags:
+      - boards
+      summary: Create an empty board
+      operationId: createBoard
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BoardIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardOut'
+        '409':
+          description: Another board already uses this key prefix.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/boards/{board_id}:
+    put:
+      tags:
+      - boards
+      summary: Rename a board or change its description
+      description: The key prefix cannot change, so story keys stay stable.
+      operationId: updateBoard
+      parameters:
+      - name: board_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Board Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BoardUpdateIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardOut'
+        '404':
+          description: The board was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - boards
+      summary: Delete a board with all its stories and their assessment history
+      operationId: deleteBoard
+      parameters:
+      - name: board_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Board Id
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: The board was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/boards/{board_id}/stories:
+    get:
+      tags:
+      - stories
+      summary: List a board's stored stories with their latest assessment
+      operationId: listStories
+      parameters:
+      - name: board_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Board Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/StoredStoryOut'
+                type: array
+                title: Response Liststories
+        '404':
+          description: The board was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      tags:
+      - stories
+      summary: Store a pasted story on a board
+      description: Adds the story to the end of the board's backlog. A board holds at most 100 stories, counting
+        every column.
+      operationId: createStory
+      parameters:
+      - name: board_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Board Id
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoryIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredStoryOut'
+        '404':
+          description: The board was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '409':
+          description: The board already holds the most stories it can.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '413':
+          description: The story is longer than the size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/stories/{story_id}:
+    get:
+      tags:
+      - stories
+      summary: Get a stored story with its latest report and assessment history
+      operationId: getStory
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredStoryDetailOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    put:
+      tags:
+      - stories
+      summary: Replace a stored story's text
+      description: Earlier assessments are kept; the story is marked stale until it is assessed again.
+      operationId: updateStory
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoryIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredStoryOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '413':
+          description: The story is longer than the size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - stories
+      summary: Delete a stored story and its assessment history
+      operationId: deleteStory
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/stories/{story_id}/move:
+    put:
+      tags:
+      - stories
+      summary: Move a stored story to a workflow column and position
+      description: Used by drag and drop on the board. Does not change the story's text or mark it stale. Moving to the blocked column requires a blocked_reason; moving anywhere else clears it.
+      operationId: moveStory
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoryMoveIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredStoryOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/stories/{story_id}/assess:
+    post:
+      tags:
+      - stories
+      summary: Assess a stored story and save the report to its history
+      operationId: assessStoredStory
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '413':
+          description: The story is longer than the size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '502':
+          description: The TypeSafe request failed.
           content:
             application/json:
               schema:
@@ -173,7 +638,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorOut'
         '409':
-          description: LINEAR_WEBHOOK_SECRET is not configured on the server.
+          description: The Linear integration is disabled, or LINEAR_WEBHOOK_SECRET is not configured on the server.
           content:
             application/json:
               schema:
@@ -223,6 +688,116 @@ components:
         description: As an API client developer, I want POST /api/orders to reject line items with quantity
           greater than 999 so that bulk orders go through the wholesale flow.
         title: Reject orders with quantity above 999
+    AssessmentSummaryOut:
+      properties:
+        verdict:
+          type: string
+          enum:
+          - ready
+          - discuss
+          - needs_refinement
+          - not_ready
+          title: Verdict
+        quality:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Quality
+        question_count:
+          type: integer
+          title: Question Count
+          description: Questions for the author in this assessment.
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - verdict
+      - quality
+      - question_count
+      - created_at
+      title: AssessmentSummaryOut
+    BoardIn:
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          minLength: 1
+          title: Name
+          example: Flowershop Website (Frontend + Backend)
+        description:
+          type: string
+          maxLength: 500
+          title: Description
+          default: ''
+        key_prefix:
+          type: string
+          maxLength: 6
+          minLength: 2
+          pattern: ^[A-Z][A-Z0-9]+$
+          title: Key Prefix
+          description: Prefix of the board's story keys, e.g. FLW for FLW-1. Uppercase letters and digits, starting
+            with a letter. Unique among boards and fixed once the board is created.
+          example: FLW
+      type: object
+      required:
+      - name
+      - key_prefix
+      title: BoardIn
+    BoardOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        name:
+          type: string
+          title: Name
+        description:
+          type: string
+          title: Description
+        key_prefix:
+          type: string
+          title: Key Prefix
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        story_count:
+          type: integer
+          title: Story Count
+          description: Stories on the board, in every column.
+        story_limit:
+          type: integer
+          title: Story Limit
+          description: The most stories the board can hold.
+          example: 100
+      type: object
+      required:
+      - id
+      - name
+      - description
+      - key_prefix
+      - created_at
+      - story_count
+      - story_limit
+      title: BoardOut
+    BoardUpdateIn:
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          minLength: 1
+          title: Name
+        description:
+          type: string
+          maxLength: 500
+          title: Description
+          default: ''
+      type: object
+      required:
+      - name
+      title: BoardUpdateIn
     CheckOut:
       properties:
         id:
@@ -334,6 +909,63 @@ components:
       - definition_of_ready: []
         key: ENG-123
         post_comment: false
+    IssueCardOut:
+      properties:
+        key:
+          type: string
+          title: Key
+        title:
+          type: string
+          title: Title
+        description:
+          type: string
+          title: Description
+        url:
+          type: string
+          title: Url
+        labels:
+          items:
+            type: string
+          type: array
+          title: Labels
+        state_type:
+          type: string
+          title: State Type
+          description: Linear workflow state type, e.g. `backlog`, `unstarted` or `started`.
+        readiness:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Readiness
+          description: Suffix of the issue's readiness:* label, e.g. `ready`, `stale` or `error`; null if
+            none.
+      type: object
+      required:
+      - key
+      - title
+      - description
+      - url
+      - labels
+      - state_type
+      - readiness
+      title: IssueCardOut
+    LinearTeamOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        key:
+          type: string
+          title: Key
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+      - id
+      - key
+      - name
+      title: LinearTeamOut
     ReportOut:
       properties:
         verdict:
@@ -427,6 +1059,258 @@ components:
       - name
       - configured
       title: SourceOut
+    StoredStoryDetailOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        board_id:
+          type: string
+          title: Board Id
+        key:
+          type: string
+          title: Key
+          description: 'Short, human-readable key: the board''s prefix and a number, e.g. FLW-12. Never reused
+            after a delete.'
+        title:
+          type: string
+          title: Title
+        description:
+          type: string
+          title: Description
+        acceptance_criteria:
+          type: string
+          title: Acceptance Criteria
+        definition_of_ready:
+          items:
+            type: string
+          type: array
+          title: Definition Of Ready
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        updated_at:
+          type: string
+          format: date-time
+          title: Updated At
+        status:
+          type: string
+          enum:
+          - backlog
+          - refinement
+          - ready_for_sprint
+          - in_sprint
+          - done
+          - blocked
+          title: Status
+          description: Workflow column on the board.
+        position:
+          type: number
+          title: Position
+        blocked_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Blocked Reason
+          description: Why the story is blocked; set only in the blocked column.
+        latest:
+          anyOf:
+          - $ref: '#/components/schemas/AssessmentSummaryOut'
+          - type: 'null'
+          description: The latest assessment, or null if never assessed.
+        previous_quality:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Previous Quality
+          description: Quality of the assessment before the latest one.
+        stale:
+          type: boolean
+          title: Stale
+          description: The story was edited after its latest assessment.
+        report:
+          anyOf:
+          - $ref: '#/components/schemas/ReportOut'
+          - type: 'null'
+          description: Full report of the latest assessment.
+        history:
+          items:
+            $ref: '#/components/schemas/AssessmentSummaryOut'
+          type: array
+          title: History
+          description: All assessments, newest first.
+      type: object
+      required:
+      - id
+      - board_id
+      - key
+      - title
+      - description
+      - acceptance_criteria
+      - definition_of_ready
+      - created_at
+      - updated_at
+      - status
+      - position
+      - blocked_reason
+      - latest
+      - previous_quality
+      - stale
+      - report
+      - history
+      title: StoredStoryDetailOut
+    StoredStoryOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        board_id:
+          type: string
+          title: Board Id
+        key:
+          type: string
+          title: Key
+          description: 'Short, human-readable key: the board''s prefix and a number, e.g. FLW-12. Never reused
+            after a delete.'
+        title:
+          type: string
+          title: Title
+        description:
+          type: string
+          title: Description
+        acceptance_criteria:
+          type: string
+          title: Acceptance Criteria
+        definition_of_ready:
+          items:
+            type: string
+          type: array
+          title: Definition Of Ready
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        updated_at:
+          type: string
+          format: date-time
+          title: Updated At
+        status:
+          type: string
+          enum:
+          - backlog
+          - refinement
+          - ready_for_sprint
+          - in_sprint
+          - done
+          - blocked
+          title: Status
+          description: Workflow column on the board.
+        position:
+          type: number
+          title: Position
+        blocked_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Blocked Reason
+          description: Why the story is blocked; set only in the blocked column.
+        latest:
+          anyOf:
+          - $ref: '#/components/schemas/AssessmentSummaryOut'
+          - type: 'null'
+          description: The latest assessment, or null if never assessed.
+        previous_quality:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Previous Quality
+          description: Quality of the assessment before the latest one.
+        stale:
+          type: boolean
+          title: Stale
+          description: The story was edited after its latest assessment.
+      type: object
+      required:
+      - id
+      - board_id
+      - key
+      - title
+      - description
+      - acceptance_criteria
+      - definition_of_ready
+      - created_at
+      - updated_at
+      - status
+      - position
+      - blocked_reason
+      - latest
+      - previous_quality
+      - stale
+      title: StoredStoryOut
+    StoryIn:
+      properties:
+        title:
+          type: string
+          maxLength: 500
+          minLength: 1
+          title: Title
+          description: The story's title or summary.
+        description:
+          type: string
+          maxLength: 10000
+          title: Description
+          default: ''
+          description: The story body. If `acceptance_criteria` is empty, a section under an 'Acceptance criteria'
+            heading here is moved into it.
+        acceptance_criteria:
+          type: string
+          maxLength: 10000
+          title: Acceptance Criteria
+          default: ''
+          description: One criterion per bullet, or Given/When/Then scenarios.
+        definition_of_ready:
+          items:
+            type: string
+          type: array
+          maxItems: 50
+          title: Definition Of Ready
+          description: Extra requirements from the team's Definition of Ready, one per item. Each becomes
+            a yes/no check. Blank and duplicate items are dropped; at most 12 are used, each cut to 300 characters.
+      type: object
+      required:
+      - title
+      title: StoryIn
+      description: A story to store. Same fields and limits as AssessRequest.
+    StoryMoveIn:
+      properties:
+        status:
+          type: string
+          enum:
+          - backlog
+          - refinement
+          - ready_for_sprint
+          - in_sprint
+          - done
+          - blocked
+          title: Status
+          description: Workflow column on the board.
+        position:
+          type: number
+          title: Position
+          description: Order within the column, ascending. The client picks a value between the neighbours.
+        blocked_reason:
+          anyOf:
+          - type: string
+            maxLength: 500
+          - type: 'null'
+          title: Blocked Reason
+          description: Why the story is blocked. Required when status is blocked; not allowed otherwise.
+      type: object
+      required:
+      - status
+      - position
+      title: StoryMoveIn
     StoryOut:
       properties:
         title:
@@ -525,5 +1409,9 @@ tags:
   description: Judge a story's readiness.
 - name: sources
   description: Issue trackers that stories can be imported from.
+- name: boards
+  description: Boards that each hold up to 100 stories for one goal.
+- name: stories
+  description: Pasted stories stored in SQLite, with their assessment history.
 - name: webhooks
   description: Inbound event hooks from issue trackers.

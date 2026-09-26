@@ -1,0 +1,107 @@
+{
+  "_comment": "Fictional backlog of a Scrum team building a B2B spare-parts ordering portal: Java 21 / Spring Boot backend (order-service) and React + TypeScript frontend (web). File paths, services and people are made up. Loaded by scripts/seed_example_stories.py; 'status' is the board column ('blocked' stories also need 'blocked_reason'), 'assess' runs a real Jev assessment, 'edit_after_assess' changes the story afterwards so it shows as edited since assessed.",
+  "stories": [
+    {
+      "status": "done",
+      "assess": true,
+      "title": "Sign in to the portal with the company SSO",
+      "description": "As a buyer at a customer company I want to sign in with my company's single sign-on account so that I don't need a separate portal password.\n\nBackend: configure Spring Security as an OAuth2 resource server in order-service (order-service/src/main/java/com/example/orders/config/SecurityConfig.java) that validates JWTs from our OpenID Connect provider. The issuer URL is already in application.yml as `portal.oidc.issuer`. Map the `customer_id` claim to the authenticated principal, like the existing `ApiKeyAuthenticationFilter` does for API keys.\n\nFrontend: use the existing `AuthProvider` in web/src/auth/AuthProvider.tsx with oidc-client-ts; the login page is web/src/pages/LoginPage.tsx.\n\nRollout: behind the feature flag `sso-login` (existing flag service); password login stays available until the flag is removed.",
+      "acceptance_criteria": "- Given a valid token from the provider, when the buyer calls GET /api/orders, then the response is 200 and only that customer's orders are returned\n- Given an expired or unsigned token, when any /api endpoint is called, then the response is 401 with error code TOKEN_INVALID\n- Given a token without a customer_id claim, then the response is 403 with error code CUSTOMER_MISSING\n- Given the flag sso-login is off, then the login page shows only the password form\n- Tests: SecurityConfigTest (JUnit 5, MockMvc) covers the three token cases; LoginPage.test.tsx covers the flag; `./mvnw test` and `npm test` in web pass"
+    },
+    {
+      "status": "done",
+      "assess": true,
+      "title": "Show order status badges in the order list",
+      "description": "As a buyer I want to see each order's status at a glance in my order list so that I know which orders still need attention without opening them.\n\nAdd a `StatusBadge` component in web/src/features/orders/StatusBadge.tsx and use it in the Status column of web/src/features/orders/OrderList.tsx. The API already returns `status` (one of PENDING, CONFIRMED, SHIPPED, DELIVERED, CANCELLED) from GET /api/orders; no backend change.\n\nLabels and colours follow the design tokens in web/src/theme/tokens.css: PENDING grey, CONFIRMED blue, SHIPPED indigo, DELIVERED green, CANCELLED red, each with the status as text so it does not rely on colour alone.",
+      "acceptance_criteria": "- Given an order with status SHIPPED, when the order list renders, then its row shows a badge with the text \"Shipped\"\n- Given an unknown status value from the API, then the badge shows the raw value in grey instead of crashing\n- Each badge has a contrast ratio of at least 4.5:1 in light and dark mode\n- Tests: StatusBadge.test.tsx (Vitest + Testing Library) covers all five statuses and the unknown case; `npm test` in web passes"
+    },
+    {
+      "status": "in_sprint",
+      "assess": true,
+      "title": "Reject order lines with a quantity above 999",
+      "description": "As an API client developer at a customer I want POST /api/orders to reject order lines with a quantity above 999 so that bulk orders go through the wholesale process instead of blocking our warehouse.\n\nAdd the check to `OrderRequestValidator` in order-service/src/main/java/com/example/orders/api/OrderRequestValidator.java, next to the existing check for quantities below 1. Return the error in the existing `ApiError` format used by `GlobalExceptionHandler`.\n\nNo rollout flag needed: no customer has ordered more than 200 of one part in the last 12 months (query in the ticket comments).",
+      "acceptance_criteria": "- Given an order line with quantity 1000, when POST /api/orders is called, then the response is 400 with error code QUANTITY_TOO_LARGE and the index of the failing line\n- Given an order line with quantity 999, then the order is created (201)\n- Given two failing lines, then both indexes are listed in the error\n- Tests: new cases in OrderRequestValidatorTest and OrderControllerTest (JUnit 5, MockMvc); `./mvnw test` passes"
+    },
+    {
+      "status": "in_sprint",
+      "assess": true,
+      "title": "Show a quantity error in the order form",
+      "description": "As a buyer I want the order form to tell me when a quantity is above 999 before I submit so that I can split the order or contact wholesale right away.\n\nIn web/src/features/orders/OrderForm.tsx, extend the existing zod schema `orderLineSchema` with `max(999)` and show the message under the quantity field, the same way the \"at least 1\" error is shown today. If the API still returns QUANTITY_TOO_LARGE (for example from an old browser tab), map it to the same message on the failing line using `mapApiErrors` in web/src/features/orders/errors.ts.\n\nMessage text (approved by product): \"Orders above 999 pieces go through wholesale. Contact wholesale@example.com.\"",
+      "acceptance_criteria": "- Given the buyer types 1000 in a quantity field, when the field loses focus, then the message is shown under that field and Submit is disabled\n- Given the buyer changes it to 999, then the message disappears and Submit is enabled\n- Given the API answers 400 QUANTITY_TOO_LARGE for line 2, then the message appears under line 2\n- Tests: OrderForm.test.tsx (Vitest + Testing Library) covers the three cases; `npm test` in web passes"
+    },
+    {
+      "status": "in_sprint",
+      "assess": true,
+      "title": "Dark mode for the customer portal",
+      "description": "As a buyer I want a dark mode so that the portal is easier on the eyes.\n\nWe should probably follow the operating system setting, but maybe also add a toggle in the header. Design hasn't made the dark colours yet; we could start with inverted colours and adjust later.",
+      "acceptance_criteria": "- The portal supports dark mode\n- It looks good"
+    },
+    {
+      "status": "ready_for_sprint",
+      "assess": true,
+      "title": "Retry failed ERP sync calls with exponential backoff",
+      "description": "Technical story. order-service sends confirmed orders to the ERP via `ErpClient` (order-service/src/main/java/com/example/orders/erp/ErpClient.java). About 2% of calls fail with 503 during the ERP's nightly batch window, and those orders stay unsynced until someone resends them by hand.\n\nWrap `ErpClient.sendOrder` with a Spring Retry `@Retryable` policy: retry on 503 and on connection timeouts only, at most 5 attempts, exponential backoff starting at 2 s and capped at 60 s. After the last attempt, keep today's behaviour (mark the order `ERP_SYNC_FAILED` and log it).\n\nRollout: behind the config property `erp.retry.enabled` (default false), enabled first in staging for one week and watched on the existing Grafana dashboard \"ERP sync\"; turning the property off restores today's behaviour without a deploy.",
+      "acceptance_criteria": "- Given the ERP answers 503 twice and then 200, when an order is confirmed, then it is synced and marked ERP_SYNCED after 3 attempts\n- Given the ERP answers 400, then there is no retry and the order is marked ERP_SYNC_FAILED\n- Given 5 failed attempts, then the order is marked ERP_SYNC_FAILED and one error is logged with the order number\n- Given erp.retry.enabled=false, then behaviour is unchanged (one attempt)\n- Tests: ErpClientRetryTest with WireMock covers the four cases; `./mvnw test` passes"
+    },
+    {
+      "status": "ready_for_sprint",
+      "assess": true,
+      "title": "Upgrade order-service to Spring Boot 3.5",
+      "description": "Technical story. order-service runs Spring Boot 3.2, which is out of open-source support. Upgrade to Spring Boot 3.5.\n\nSome dependencies might need upgrading too. We should check whether anything breaks.",
+      "acceptance_criteria": "- order-service runs on Spring Boot 3.5\n- All tests pass"
+    },
+    {
+      "status": "refinement",
+      "assess": true,
+      "title": "Let customers export their order history as CSV",
+      "description": "As a registered customer I want to download my order history as a CSV file so that I can import it into my bookkeeping tool.\n\nAdd an \"Export CSV\" button to the Order History page. The file should contain one row per order. Which columns to include is still to be decided with the finance team. Large histories might need to be generated in the background.",
+      "acceptance_criteria": "- Given a customer with orders, when they click Export CSV, then a CSV file downloads\n- Given a customer with no orders, then the button is disabled\n- The export works for customers with many orders"
+    },
+    {
+      "status": "refinement",
+      "assess": true,
+      "title": "Invoice PDF shows wrong VAT for Austrian customers",
+      "description": "Bug reported by customer support: invoices for customers in Austria show 19% VAT instead of 20%.\n\nInvoices are generated by `InvoicePdfService` in order-service. It probably uses the German rate as a default somewhere.",
+      "acceptance_criteria": "- Austrian invoices show the correct VAT"
+    },
+    {
+      "status": "refinement",
+      "assess": true,
+      "title": "Email the buyer when an order ships",
+      "description": "As a buyer I want an email when my order ships so that I can plan receiving the parts.\n\nWhen order-service receives the `ShipmentCreated` event from the warehouse (existing Kafka topic `warehouse.shipments`, consumed in order-service/src/main/java/com/example/orders/shipping/ShipmentListener.java), send an email through the existing `NotificationClient` with template `order-shipped` (already created by marketing, id in the ticket). The email contains the order number, the carrier and the tracking link.\n\nOnly buyers who have \"Shipping updates\" switched on in their notification settings get the email (field `notifyOnShipment` on `Buyer`).",
+      "acceptance_criteria": "- Given a ShipmentCreated event for an order of a buyer with notifyOnShipment=true, then one email is sent with the order number, carrier and tracking link\n- Given notifyOnShipment=false, then no email is sent\n- Given the same event twice, then only one email is sent (deduplicated by shipment id)\n- Given NotificationClient fails, then the event is retried by the existing Kafka retry topic and nothing is lost\n- Tests: ShipmentListenerTest (JUnit 5, embedded Kafka) covers the four cases; `./mvnw test` passes",
+      "edit_after_assess": {
+        "description": "As a buyer I want an email when my order ships so that I can plan receiving the parts.\n\nWhen order-service receives the `ShipmentCreated` event from the warehouse (existing Kafka topic `warehouse.shipments`, consumed in order-service/src/main/java/com/example/orders/shipping/ShipmentListener.java), send an email through the existing `NotificationClient` with template `order-shipped` (already created by marketing, id in the ticket). The email contains the order number, the carrier and the tracking link.\n\nUpdate from the refinement meeting: partial shipments are also possible now, so maybe we send one email per parcel, or one summary email per day. To be decided with the warehouse team.\n\nOnly buyers who have \"Shipping updates\" switched on in their notification settings get the email (field `notifyOnShipment` on `Buyer`)."
+      }
+    },
+    {
+      "status": "backlog",
+      "assess": true,
+      "title": "Improve performance",
+      "description": "The portal feels slow. We should make it faster.",
+      "acceptance_criteria": ""
+    },
+    {
+      "status": "backlog",
+      "assess": false,
+      "title": "Search products by manufacturer part number",
+      "description": "As a buyer I want to search the catalogue by the manufacturer's part number so that I can reorder a part I have in my hand without knowing our internal article number.\n\nBackend: add `mpn` to the product search in order-service (ProductSearchController). Frontend: the search box in web/src/features/catalog/SearchBar.tsx.",
+      "acceptance_criteria": "- Given a buyer searches for an exact manufacturer part number, then the matching product is the first result\n- Given a part number with or without dashes, then both find the product"
+    },
+    {
+      "status": "backlog",
+      "assess": false,
+      "title": "Let buyers save favourite products",
+      "description": "As a buyer I want to mark products as favourites so that I can reorder the parts we use often in a few clicks.",
+      "acceptance_criteria": ""
+    },
+    {
+      "status": "blocked",
+      "blocked_reason": "Waiting for the warehouse team to publish the stock API (planned for next sprint)",
+      "assess": true,
+      "title": "Show live stock levels on the product page",
+      "description": "As a buyer I want to see how many pieces of a part are in stock before I order so that I can plan around delivery times.\n\nBackend: add GET /api/products/{id}/stock to order-service, calling the warehouse's new stock API through a `WarehouseStockClient` (order-service/src/main/java/com/example/orders/warehouse/), cached for 60 seconds with the existing Caffeine cache config. Frontend: show the stock in web/src/features/catalog/ProductPage.tsx next to the price.\n\nThe warehouse stock API is not published yet; its contract (OpenAPI file) was shared in the ticket.",
+      "acceptance_criteria": "- Given a part with 12 pieces in stock, when the buyer opens its product page, then it shows \"12 in stock\"\n- Given 0 pieces, then it shows \"Out of stock\" and the expected restock date if the API returns one\n- Given the stock API does not answer within 2 s, then the page shows \"Stock unavailable\" and the price as usual\n- Tests: WarehouseStockClientTest with WireMock covers the three cases; ProductPage.test.tsx covers the three texts; `./mvnw test` and `npm test` in web pass"
+    }
+  ]
+}

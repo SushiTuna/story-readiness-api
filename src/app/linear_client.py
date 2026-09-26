@@ -46,6 +46,14 @@ class LinearIssue:
     url: str
     team_id: str = ""
     labels: list[LinearLabel] = field(default_factory=list)
+    state_type: str = ""  # Linear workflow state type: triage, backlog, unstarted, started, completed, canceled
+
+
+@dataclass
+class LinearTeam:
+    id: str
+    key: str
+    name: str
 
 
 @dataclass
@@ -125,6 +133,19 @@ async def _graphql(query: str, variables: dict) -> dict:
     return body
 
 
+# Fields selected for every issue; _to_issue maps them to a LinearIssue.
+_ISSUE_FIELDS = """
+    id
+    identifier
+    title
+    description
+    url
+    team { id }
+    labels { nodes { id name } }
+    state { type }
+"""
+
+
 async def fetch_issue(key: str) -> LinearIssue:
     """Fetch a Linear issue by its identifier (e.g. ``ENG-123``).
 
@@ -135,13 +156,7 @@ async def fetch_issue(key: str) -> LinearIssue:
     query = """
         query($id: String!) {
             issue(id: $id) {
-                id
-                identifier
-                title
-                description
-                url
-                team { id }
-                labels { nodes { id name } }
+    """ + _ISSUE_FIELDS + """
             }
         }
     """
@@ -165,16 +180,65 @@ async def fetch_issue(key: str) -> LinearIssue:
     if issue is None:
         raise LinearError("not_found", f"Issue not found: {key}")
 
-    raw_labels = (issue.get("labels") or {}).get("nodes") or []
+    return _to_issue(issue)
+
+
+def _to_issue(node: dict) -> LinearIssue:
+    raw_labels = (node.get("labels") or {}).get("nodes") or []
     return LinearIssue(
-        id=issue["id"],
-        identifier=issue["identifier"],
-        title=issue["title"],
-        description=issue.get("description") or "",
-        url=issue["url"],
-        team_id=(issue.get("team") or {}).get("id") or "",
+        id=node["id"],
+        identifier=node["identifier"],
+        title=node["title"],
+        description=node.get("description") or "",
+        url=node["url"],
+        team_id=(node.get("team") or {}).get("id") or "",
         labels=[LinearLabel(id=l["id"], name=l["name"]) for l in raw_labels],
+        state_type=(node.get("state") or {}).get("type") or "",
     )
+
+
+async def list_teams() -> list[LinearTeam]:
+    """Return the teams the token can see. Raises :class:`LinearError` like ``_graphql``."""
+    body = await _graphql("query { teams { nodes { id key name } } }", {})
+    errors = body.get("errors", [])
+    if errors:
+        raise LinearError("upstream", errors[0].get("message", "teams query failed"))
+    nodes = ((body.get("data") or {}).get("teams") or {}).get("nodes") or []
+    return [LinearTeam(id=t["id"], key=t["key"], name=t["name"]) for t in nodes]
+
+
+async def list_team_issues(team_id: str, limit: int = 100) -> list[LinearIssue]:
+    """Return up to *limit* open issues of a team (not completed or canceled), newest update first.
+
+    Raises :class:`LinearError` with kind ``"not_found"`` for an unknown team.
+    """
+    # Team.issues, IssueFilter.state and StringComparator.nin are in Linear's
+    # published schema: https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql
+    query = f"""
+        query($id: String!, $first: Int!) {{
+            team(id: $id) {{
+                issues(
+                    first: $first
+                    orderBy: updatedAt
+                    filter: {{ state: {{ type: {{ nin: ["completed", "canceled"] }} }} }}
+                ) {{
+                    nodes {{ {_ISSUE_FIELDS} }}
+                }}
+            }}
+        }}
+    """
+    body = await _graphql(query, {"id": team_id, "first": limit})
+    errors = body.get("errors", [])
+    if errors:
+        first = errors[0]
+        msg = first.get("message", "")
+        if first.get("extensions", {}).get("code") == "INPUT_ERROR" and msg.startswith("Entity not found"):
+            raise LinearError("not_found", f"Team not found: {team_id}")
+        raise LinearError("upstream", msg or "team issues query failed")
+    team = (body.get("data") or {}).get("team")
+    if team is None:
+        raise LinearError("not_found", f"Team not found: {team_id}")
+    return [_to_issue(node) for node in (team.get("issues") or {}).get("nodes") or []]
 
 
 async def post_comment(issue_id: str, body: str) -> str:
@@ -422,6 +486,23 @@ def _section_items(comment_body: str, heading: str) -> list[str]:
     return items
 
 
+def author_questions(report: ReportOut) -> tuple[list[str], list[str]]:
+    """Return (questions, notes) for the story's author.
+
+    Questions come only from checks that need action. Flags are display-only, so a
+    failing flag becomes a note rather than a question.
+    """
+    questions: list[str] = []
+    notes: list[str] = []
+    for check in report.checks:
+        if check.kind == CheckKind.flag:
+            if not check.passed:
+                notes.extend(check.ask)
+        elif not check.passed or check.unsure:
+            questions.extend(check.ask)
+    return questions, notes
+
+
 def format_report_comment(
     report: ReportOut,
     *,
@@ -475,16 +556,7 @@ def format_report_comment(
         lines += ["", "### Items to discuss", ""]
         lines += [f"- {t}" for t in discuss]
 
-    # Questions only for checks that need action. Flags are display-only, so a
-    # failing flag becomes a note rather than a question.
-    questions: list[str] = []
-    notes: list[str] = []
-    for check in report.checks:
-        if check.kind == CheckKind.flag:
-            if not check.passed:
-                notes.extend(check.ask)
-        elif not check.passed or check.unsure:
-            questions.extend(check.ask)
+    questions, notes = author_questions(report)
 
     if questions:
         lines += ["", "### Questions for the author", ""]

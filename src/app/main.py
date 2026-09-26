@@ -2,18 +2,33 @@ from dotenv import load_dotenv
 
 load_dotenv()  # load .env before any SDK/config reads
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app import story_store
 from app.routers import assess as assess_router
+from app.routers import boards as boards_router
 from app.routers import sources as sources_router
+from app.routers import stories as stories_router
 from app.routers import webhooks as webhooks_router
 
-app = FastAPI(title="Story Readiness API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    story_store.init_db()
+    yield
+
+
+app = FastAPI(title="Story Readiness API", version="0.1.0", lifespan=lifespan)
 
 app.include_router(assess_router.router, prefix="/api")
 app.include_router(sources_router.router, prefix="/api")
+app.include_router(boards_router.router, prefix="/api")
+app.include_router(stories_router.router, prefix="/api")
 app.include_router(webhooks_router.router, prefix="/api")
 
 
