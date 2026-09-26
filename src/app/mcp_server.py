@@ -62,6 +62,8 @@ You are working with a Story Board backed by SQLite. Each board holds at most 10
 
 Rules:
 - A story in the "blocked" column MUST have a blocked_reason.
+- While a story's latest verdict is "discuss" or "needs_refinement" (even if stale), it can only move to
+  "backlog" or "refinement", or within its current column. Refine it and assess it again to lift this.
 - Moving a story INTO "done" MUST include done_evidence: at least one test report (unit, integration or
   cucumber) as a local file path or a URL, ui_change (true if the story changes the UI; then at least one
   screenshot or recording), and at least one commit (hash and message). The evidence is attached to the
@@ -475,6 +477,8 @@ def _upload_paths(story_id: str, evidence: DoneEvidenceIn, saved: list[str]) -> 
         "status: one of backlog/refinement/ready_for_sprint/in_sprint/done/blocked. "
         "place: 'top' (position = min - 1) or 'bottom' (position = max + 1, default). "
         "blocked_reason: required when moving to 'blocked'; not allowed otherwise. "
+        "A story whose latest verdict is discuss or needs_refinement can only move to backlog or refinement "
+        "until it is assessed again. "
         "done_evidence: required when moving INTO 'done'; not allowed otherwise. Test reports and "
         "screenshots/recordings are absolute local file paths (uploaded for you) or URLs. "
         "note: required — why you are moving this story."
@@ -525,7 +529,7 @@ def move_story(
             done_evidence=evidence.model_dump() if evidence is not None else None,
             actor=_actor(ctx, note),
         )
-    except story_store.EvidenceError as exc:
+    except (story_store.EvidenceError, story_store.ReadinessError) as exc:
         _discard(saved)
         raise ToolError(str(exc)) from exc
     except BaseException:

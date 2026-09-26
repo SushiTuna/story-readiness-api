@@ -7,6 +7,7 @@ from httpx import ASGITransport, AsyncClient
 from app import story_store
 from app.jev_client import JevError
 from app.main import app
+from app.schemas import VerdictEnum
 from tests.test_routes import _make_report
 
 _BODY = {
@@ -177,6 +178,25 @@ async def test_move_unknown_story_is_404_and_bad_status_is_422(client):
     story = await _create(client)
     resp = await client.put(f"/api/stories/{story['id']}/move", json={"status": "shipped", "position": 1})
     assert resp.status_code == 422
+
+
+async def test_move_out_of_refinement_with_a_discuss_verdict_is_422(client, monkeypatch):
+    async def discuss(body, *, source):
+        report = _make_report()
+        report.verdict = VerdictEnum.discuss
+        return report
+
+    monkeypatch.setattr("app.engine.assess", discuss)
+    story = await _create(client)
+    await client.post(f"/api/stories/{story['id']}/assess")
+    move = f"/api/stories/{story['id']}/move"
+
+    resp = await client.put(move, json={"status": "ready_for_sprint", "position": 1})
+    assert resp.status_code == 422
+    [error] = resp.json()["detail"]
+    assert (error["loc"], error["type"]) == (["body", "status"], "status_not_allowed")
+    assert "Discuss" in error["msg"]
+    assert (await client.put(move, json={"status": "refinement", "position": 1})).status_code == 200
 
 
 async def test_move_to_blocked_keeps_reason_until_moved_out(client, monkeypatch):

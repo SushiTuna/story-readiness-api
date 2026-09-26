@@ -45,6 +45,12 @@ def evidence_invalid(message: str) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": [error]})
 
 
+def status_not_allowed(message: str) -> JSONResponse:
+    """422 for a move the story's verdict does not allow, in the same shape as a request validation error."""
+    error = {"loc": ["body", "status"], "msg": message, "type": "status_not_allowed"}
+    return JSONResponse(status_code=422, content={"detail": [error]})
+
+
 def evidence_not_found() -> JSONResponse:
     return _error(404, "The evidence file was not found.")
 

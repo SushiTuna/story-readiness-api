@@ -24,6 +24,7 @@ from app.routers.errors import (
     evidence_too_large,
     evidence_type_not_allowed,
     jev_unavailable,
+    status_not_allowed,
     too_large,
 )
 from app.schemas import (
@@ -216,7 +217,9 @@ def update_story(story_id: str, body: StoryIn) -> StoredStoryOut | JSONResponse:
         "Used by drag and drop on the board. Does not change the story's text or mark it stale. "
         "Moving to the blocked column requires a blocked_reason; moving anywhere else clears it. "
         "Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); "
-        "it is recorded in the story's activity."
+        "it is recorded in the story's activity. "
+        "While the latest assessment's verdict is discuss or needs_refinement (even if stale), the story can only "
+        "move to backlog or refinement, or within its current column, until it is assessed again."
     ),
     responses=_NOT_FOUND,
 )
@@ -227,6 +230,8 @@ def move_story(story_id: str, body: StoryMoveIn) -> StoredStoryOut | JSONRespons
             story_id, status=body.status, position=body.position, blocked_reason=body.blocked_reason,
             done_evidence=evidence,
         )
+    except story_store.ReadinessError as exc:
+        return status_not_allowed(str(exc))
     except story_store.EvidenceError as exc:
         return evidence_invalid(str(exc))
     if story is None:

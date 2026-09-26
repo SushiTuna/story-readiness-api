@@ -686,7 +686,7 @@ paths:
       tags:
       - stories
       summary: Move a stored story to a workflow column and position
-      description: Used by drag and drop on the board. Does not change the story's text or mark it stale. Moving to the blocked column requires a blocked_reason; moving anywhere else clears it. Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); it is recorded in the story's activity. Missing or unusable evidence is a 422 with loc ["body", "done_evidence"].
+      description: Used by drag and drop on the board. Does not change the story's text or mark it stale. Moving to the blocked column requires a blocked_reason; moving anywhere else clears it. Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); it is recorded in the story's activity. Missing or unusable evidence is a 422 with loc ["body", "done_evidence"]. While the latest assessment's verdict is discuss or needs_refinement (even if stale), the story can only move to backlog or refinement, or within its current column, until it is assessed again; any other column is a 422 with loc ["body", "status"] and type status_not_allowed.
       operationId: moveStory
       parameters:
       - name: story_id

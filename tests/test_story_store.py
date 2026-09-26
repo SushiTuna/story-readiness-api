@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from app import story_store
-from app.schemas import CheckKind, CheckOut
+from app.schemas import CheckKind, CheckOut, VerdictEnum
 from tests.test_routes import _make_report
 
 _STORY = {
@@ -160,6 +160,53 @@ def test_move_unknown_story_returns_none_and_bad_status_raises():
     story = _create()
     with pytest.raises(ValueError):
         story_store.move_story(story.id, status="shipped", position=1)
+
+
+def _assessed(story: story_store.StoredStory, verdict: VerdictEnum) -> None:
+    report = _report(0.5)
+    report.verdict = verdict
+    story_store.add_assessment(story, report)
+
+
+@pytest.mark.parametrize("verdict", [VerdictEnum.discuss, VerdictEnum.needs_refinement])
+def test_discuss_or_needs_refinement_stories_stay_in_backlog_or_refinement(verdict):
+    story = _create()
+    _assessed(story, verdict)
+    for status in ("ready_for_sprint", "in_sprint", "done", "blocked"):
+        with pytest.raises(story_store.ReadinessError, match="ST-1 .* can only move to Backlog or Refinement"):
+            story_store.move_story(story.id, status=status, position=1, blocked_reason="Stuck", done_evidence=_evidence())
+    assert story_store.get_story(story.id).status == "backlog"
+    assert [e.action for e in story_store.list_activity(_st_board().id, story.id)].count("story_moved") == 0
+    assert story_store.move_story(story.id, status="refinement", position=1).status == "refinement"
+    assert story_store.move_story(story.id, status="backlog", position=1).status == "backlog"
+
+
+def test_a_stale_discuss_verdict_still_restricts_until_assessed_again():
+    story = _create()
+    _assessed(story, VerdictEnum.discuss)
+    edited = story_store.update_story(story.id, **{**_STORY, "title": "Export orders as CSV, refined"})
+    with pytest.raises(story_store.ReadinessError):
+        story_store.move_story(story.id, status="ready_for_sprint", position=1)
+    _assessed(edited, VerdictEnum.ready)
+    assert story_store.move_story(story.id, status="ready_for_sprint", position=1).status == "ready_for_sprint"
+
+
+def test_a_restricted_story_already_in_another_column_can_reorder_there_or_go_back():
+    story = _create()
+    story_store.move_story(story.id, status="in_sprint", position=1)
+    _assessed(story, VerdictEnum.needs_refinement)
+    assert story_store.move_story(story.id, status="in_sprint", position=0.5).position == 0.5
+    with pytest.raises(story_store.ReadinessError):
+        story_store.move_story(story.id, status="ready_for_sprint", position=1)
+    assert story_store.move_story(story.id, status="refinement", position=1).status == "refinement"
+
+
+@pytest.mark.parametrize("verdict", [None, VerdictEnum.not_ready, VerdictEnum.ready])
+def test_other_verdicts_move_anywhere(verdict):
+    story = _create()
+    if verdict is not None:
+        _assessed(story, verdict)
+    assert story_store.move_story(story.id, status="in_sprint", position=1).status == "in_sprint"
 
 
 def test_list_orders_by_position():

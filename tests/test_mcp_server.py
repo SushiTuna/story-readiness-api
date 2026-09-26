@@ -10,6 +10,7 @@ from mcp import Client
 
 from app import story_store
 from app.mcp_server import _server
+from app.schemas import VerdictEnum
 from tests.test_routes import _make_report
 
 
@@ -107,6 +108,23 @@ async def test_move_to_top_or_bottom_of_a_column():
         assert top["position"] == 0
         first = await _call(client, "move_story", story="SHP-1", status="done", done_evidence=_EVIDENCE, note="Shipped")
         assert first["position"] == 1
+
+
+async def test_move_refuses_a_needs_refinement_story_outside_backlog_or_refinement(monkeypatch):
+    async def needs_refinement(body, *, source):
+        report = _make_report()
+        report.verdict = VerdictEnum.needs_refinement
+        return report
+
+    monkeypatch.setattr("app.engine.assess", needs_refinement)
+    async with Client(_server) as client:
+        await _call(client, "create_board", name="Shop", key_prefix="SHP", note="Start")
+        await _call(client, "create_story", board="SHP", title="A", note="Add")
+        await _call(client, "assess_story", story="SHP-1", note="Check")
+        error = await _error(client, "move_story", story="SHP-1", status="in_sprint", note="Start it")
+        assert "SHP-1 has a Needs refinement verdict" in error
+        moved = await _call(client, "move_story", story="SHP-1", status="refinement", note="Refine it")
+        assert moved["status"] == "refinement"
 
 
 async def test_agent_name_from_env(monkeypatch):

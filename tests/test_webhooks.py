@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import time
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -617,12 +618,16 @@ def test_is_fresh_stale():
 # Real payload (captured from Linear, sanitized)
 # ---------------------------------------------------------------------------
 
+# Captured with LINEAR_WEBHOOK_CAPTURE_DIR (see README) by adding a label to an issue, then sanitized.
+_REAL_PAYLOAD = Path(__file__).parent / "fixtures" / "linear_issue_update_label_added.json"
+
+
+@pytest.mark.skipif(not _REAL_PAYLOAD.exists(), reason=f"capture a real Linear delivery into {_REAL_PAYLOAD.name}")
 async def test_real_linear_payload_schedules_issue(client, monkeypatch):
     """A real Issue delivery (with a fresh timestamp) is accepted and schedules its data.id."""
     import app.routers.webhooks as wh_router
-    from pathlib import Path
 
-    fixture = json.loads((Path(__file__).parent / "fixtures" / "linear_issue_update_label_added.json").read_text())
+    fixture = json.loads(_REAL_PAYLOAD.read_text())
     payload = {**fixture["payload"], "webhookTimestamp": int(time.time() * 1000)}
     monkeypatch.setenv("LINEAR_WEBHOOK_SECRET", _SECRET)
     scheduled = []

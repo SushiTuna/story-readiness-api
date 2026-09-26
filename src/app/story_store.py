@@ -26,6 +26,11 @@ DEFAULT_DB_PATH = "data/stories.db"
 # Workflow columns of the board, in order. Stories start in the backlog.
 STATUSES = ("backlog", "refinement", "ready_for_sprint", "in_sprint", "done", "blocked")
 
+# While its latest verdict (stale or not) is one of these, a story may only move into REFINING_STATUSES, or within
+# the column it is already in. Assessing it again is the only way to lift this.
+REFINING_VERDICTS = {"discuss": "Discuss", "needs_refinement": "Needs refinement"}
+REFINING_STATUSES = ("backlog", "refinement")
+
 # Each board is scoped to one goal and holds at most this many stories, whatever their column.
 MAX_STORIES_PER_BOARD = 100
 
@@ -113,6 +118,10 @@ class DuplicateKeyPrefixError(Exception):
 
 class EvidenceError(Exception):
     """A move to Done is missing its evidence, or the evidence refers to files it can't use."""
+
+
+class ReadinessError(Exception):
+    """The story's latest verdict keeps it in Backlog or Refinement until it is assessed again."""
 
 
 class EvidenceFileTypeError(Exception):
@@ -747,6 +756,9 @@ def move_story(
 
     *blocked_reason* is kept only for the blocked column; any other column clears it.
 
+    A story whose latest verdict is in REFINING_VERDICTS, even a stale one, may only move into REFINING_STATUSES or
+    within its current column. Raises ReadinessError.
+
     Entering the done column needs *done_evidence* (DoneEvidenceIn as a dict); moving within it does not, and no
     other move takes it. Its uploaded files must belong to the story and not be used yet. They are marked attached,
     and the evidence, with each file's name, type and size, goes into the activity entry. Raises EvidenceError.
@@ -762,6 +774,15 @@ def move_story(
         old_status = old_row["status"]
         board_id = old_row["board_id"]
         story_key = f"{old_row['key_prefix']}-{old_row['number']}"
+        if status != old_status and status not in REFINING_STATUSES:
+            latest = conn.execute(
+                "SELECT verdict FROM assessments WHERE story_id = ? ORDER BY id DESC LIMIT 1", (story_id,)
+            ).fetchone()
+            if latest is not None and latest["verdict"] in REFINING_VERDICTS:
+                raise ReadinessError(
+                    f"{story_key} has a {REFINING_VERDICTS[latest['verdict']]} verdict, so it can only move to Backlog "
+                    "or Refinement. Assess it again once it is refined."
+                )
         entering_done = status == "done" and old_status != "done"
         if entering_done and done_evidence is None:
             raise EvidenceError(
