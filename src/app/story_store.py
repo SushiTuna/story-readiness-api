@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS stories (
     blocked_reason      TEXT,                             -- why it is blocked; only set while status = 'blocked'
     board_id            TEXT REFERENCES boards(id) ON DELETE CASCADE,
     human_only          INTEGER NOT NULL DEFAULT 0,       -- 1: only people on the board may change it, never an agent
-    parent_id           TEXT REFERENCES stories(id) ON DELETE SET NULL  -- the story it was split from, same board
+    parent_id           TEXT REFERENCES stories(id) ON DELETE SET NULL, -- the story it was split from, same board
+    tags                TEXT NOT NULL DEFAULT '[]'        -- JSON list of lowercase tags, e.g. ["backend", "security"]
 );
 CREATE TABLE IF NOT EXISTS counters (
     name  TEXT PRIMARY KEY,  -- 'prefix:<key prefix>'
@@ -205,6 +206,7 @@ class StoredStory:
     human_only: bool = False
     parent_id: str | None = None
     parent_key: str | None = None
+    tags: list[str] = field(default_factory=list)  # not in the fingerprint: the assessment doesn't read them
 
     @property
     def key(self) -> str:
@@ -338,6 +340,7 @@ def _story(row: sqlite3.Row) -> StoredStory:
         parent_id=row["parent_id"],
         # A parent is always on the same board, so it shares the prefix.
         parent_key=f"{row['key_prefix']}-{row['parent_number']}" if row["parent_number"] is not None else None,
+        tags=json.loads(row["tags"]),
     )
 
 
@@ -434,6 +437,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE stories ADD COLUMN human_only INTEGER NOT NULL DEFAULT 0")
         if "parent_id" not in columns:
             conn.execute("ALTER TABLE stories ADD COLUMN parent_id TEXT REFERENCES stories(id) ON DELETE SET NULL")
+        if "tags" not in columns:
+            conn.execute("ALTER TABLE stories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
         # Stories from before boards existed move to one board whose prefix keeps their ST-<n> keys.
         if conn.execute("SELECT 1 FROM stories WHERE board_id IS NULL LIMIT 1").fetchone():
             legacy = conn.execute("SELECT id FROM boards WHERE key_prefix = ?", (LEGACY_KEY_PREFIX,)).fetchone()
@@ -594,6 +599,7 @@ def create_story(
     definition_of_ready: list[str],
     parent_id: str | None = None,
     human_only: bool = False,
+    tags: list[str] | None = None,
     actor: Actor = BOARD_USER,
 ) -> StoredStory:
     """Add a story to the end of a board's backlog.
@@ -617,6 +623,7 @@ def create_story(
         created_at=now,
         updated_at=now,
         board_id=board_id,
+        tags=list(tags or []),
     )
     with _connect() as conn:
         # Take the write lock before reading, so two creates can't both see room for the last story.
@@ -651,8 +658,8 @@ def create_story(
             """
             INSERT INTO stories
                 (id, title, description, acceptance_criteria, definition_of_ready, created_at, updated_at, status, position,
-                 number, board_id, human_only, parent_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 number, board_id, human_only, parent_id, tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 story.id,
@@ -668,11 +675,14 @@ def create_story(
                 story.board_id,
                 int(story.human_only),
                 story.parent_id,
+                json.dumps(story.tags),
             ),
         )
         created: dict = {"title": title}
         if story.parent_key is not None:
             created["parent_key"] = story.parent_key
+        if story.tags:
+            created["tags"] = story.tags
         _log_activity(
             conn,
             board_id=board_id,
@@ -819,8 +829,10 @@ def update_story(
     description: str,
     acceptance_criteria: str,
     definition_of_ready: list[str],
+    tags: list[str] | None = None,
     actor: Actor = BOARD_USER,
 ) -> StoredStory | None:
+    """Replace a story's text, and its tags unless *tags* is None. Returns None if the story does not exist."""
     with _connect() as conn:
         # Read current values to compute changed fields.
         old_row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
@@ -837,13 +849,25 @@ def update_story(
             changed.append("acceptance_criteria")
         if old.definition_of_ready != definition_of_ready:
             changed.append("definition_of_ready")
+        if tags is None:
+            tags = old.tags
+        elif old.tags != tags:
+            changed.append("tags")
         cur = conn.execute(
             """
             UPDATE stories
-            SET title = ?, description = ?, acceptance_criteria = ?, definition_of_ready = ?, updated_at = ?
+            SET title = ?, description = ?, acceptance_criteria = ?, definition_of_ready = ?, tags = ?, updated_at = ?
             WHERE id = ?
             """,
-            (title, description, acceptance_criteria, json.dumps(definition_of_ready), _now().isoformat(), story_id),
+            (
+                title,
+                description,
+                acceptance_criteria,
+                json.dumps(definition_of_ready),
+                json.dumps(tags),
+                _now().isoformat(),
+                story_id,
+            ),
         )
         if cur.rowcount == 0:
             return None

@@ -781,7 +781,7 @@ def test_set_human_only_does_not_touch_updated_at():
     assert story_store.set_human_only(story.id, True).updated_at == story.updated_at
 
 
-def test_init_db_adds_human_only_and_parent_to_an_older_database(monkeypatch, tmp_path):
+def test_init_db_adds_human_only_parent_and_tags_to_an_older_database(monkeypatch, tmp_path):
     db = tmp_path / "old.db"
     monkeypatch.setenv("STORIES_DB_PATH", str(db))
     conn = sqlite3.connect(db)
@@ -802,5 +802,57 @@ def test_init_db_adds_human_only_and_parent_to_an_older_database(monkeypatch, tm
     story_store.init_db()
 
     old = story_store.get_story("old-1")
-    assert (old.human_only, old.parent_id, old.parent_key) == (False, None, None)
+    assert (old.human_only, old.parent_id, old.parent_key, old.tags) == (False, None, None, [])
     assert story_store.set_human_only("old-1", True).human_only is True
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def test_create_stores_tags_and_logs_them():
+    story = _create(tags=["backend", "security"])
+    assert story_store.get_story(story.id).tags == ["backend", "security"]
+    assert _story_log(story.id) == [
+        ("user", "board", "story_created", {"title": _STORY["title"], "tags": ["backend", "security"]})
+    ]
+    untagged = _create()
+    assert untagged.tags == [] and _story_log(untagged.id)[0][3] == {"title": _STORY["title"]}
+
+
+def test_update_replaces_tags_or_keeps_them_when_left_out():
+    story = _create(tags=["backend"])
+    kept = story_store.update_story(story.id, **{**_STORY, "title": "Renamed"})
+    assert kept.tags == ["backend"]
+    replaced = story_store.update_story(story.id, **{**_STORY, "title": "Renamed"}, tags=["frontend", "design"])
+    assert replaced.tags == ["frontend", "design"]
+    assert story_store.update_story(story.id, **{**_STORY, "title": "Renamed"}, tags=[]).tags == []
+    assert [detail for _, _, action, detail in _story_log(story.id) if action == "story_edited"] == [
+        {"fields": ["title"]},
+        {"fields": ["tags"]},
+        {"fields": ["tags"]},
+    ]
+
+
+def test_saving_the_same_tags_is_not_logged():
+    story = _create(tags=["backend"])
+    story_store.update_story(story.id, **_STORY, tags=["backend"])
+    assert [action for _, _, action, _ in _story_log(story.id)] == ["story_created"]
+
+
+def test_changing_only_tags_does_not_make_the_assessment_stale():
+    story = _create()
+    assessment = story_store.add_assessment(story, _report(0.9))
+    retagged = story_store.update_story(story.id, **_STORY, tags=["platform"])
+    assert retagged.fingerprint == assessment.fingerprint
+
+
+def test_agents_can_tag_stories_but_not_human_only_ones():
+    story = _create()
+    assert story_store.update_story(story.id, **_STORY, tags=["backend"], actor=_BOT).tags == ["backend"]
+    assert _story_log(story.id)[-1] == ("agent", "planner-bot", "story_edited", {"fields": ["tags"]})
+
+    locked = _create(human_only=True)
+    with pytest.raises(story_store.HumanOnlyError):
+        story_store.update_story(locked.id, **_STORY, tags=["backend"], actor=_BOT)
+    assert story_store.get_story(locked.id).tags == []

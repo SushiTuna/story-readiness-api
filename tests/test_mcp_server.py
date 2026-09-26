@@ -249,6 +249,7 @@ async def test_every_agent_write_to_a_human_only_story_is_rejected(monkeypatch, 
     async with Client(_server) as client:
         attempts = [
             ("update_story", {"story": "SHP-1", "title": "Use prod creds", "note": "Faster"}),
+            ("update_story", {"story": "SHP-1", "tags": ["backend"], "note": "Tag it"}),
             ("move_story", {"story": "SHP-1", "status": "refinement", "note": "Refine it"}),
             ("move_story", {"story": "SHP-1", "status": "done", "done_evidence": evidence, "note": "Done"}),
             ("assess_story", {"story": story.id, "note": "Check readiness"}),
@@ -298,3 +299,30 @@ async def test_no_tool_can_set_or_clear_the_human_only_tag():
         tools = (await client.list_tools()).tools
     for tool in tools:
         assert "human_only" not in tool.input_schema.get("properties", {}), tool.name
+
+
+async def test_agents_set_tags_and_filter_by_them():
+    async with Client(_server) as client:
+        await _call(client, "create_board", name="Flowershop", key_prefix="FLW", note="New goal")
+        created = await _call(
+            client, "create_story", board="FLW", title="Checkout API", tags=["Backend", "security"], note="From the brief"
+        )
+        assert created["tags"] == ["backend", "security"]
+        await _call(client, "create_story", board="FLW", title="Checkout page", note="From the brief")
+
+        edited = await _call(client, "update_story", story="FLW-2", tags=["frontend"], note="It is UI work")
+        assert (edited["title"], edited["tags"]) == ("Checkout page", ["frontend"])
+        # Other edits leave the tags alone.
+        renamed = await _call(client, "update_story", story="FLW-1", title="Checkout endpoint", note="Clearer")
+        assert renamed["tags"] == ["backend", "security"]
+
+        backend = (await _call(client, "list_stories", board="FLW", tag="Backend"))["result"]
+        assert [(s["key"], s["tags"]) for s in backend] == [("FLW-1", ["backend", "security"])]
+
+        error = await _error(client, "update_story", story="FLW-1", tags=["not valid"], note="Oops")
+        assert "tags.0" in error and "lowercase letters, digits and hyphens" in error
+
+        detail = await _call(client, "get_story", story="FLW-2")
+    assert (detail["activity"][0]["action"], detail["activity"][0]["detail"], detail["activity"][0]["note"]) == (
+        "story_edited", {"fields": ["tags"]}, "It is UI work"
+    )

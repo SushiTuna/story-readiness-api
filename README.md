@@ -130,6 +130,9 @@ Pasted stories can be kept in a SQLite database (`STORIES_DB_PATH`, created on s
 - **A story whose latest verdict is `discuss` or `needs_refinement` can only move to `backlog` or `refinement`**, even when the verdict is stale. It can still be reordered within the column it is in. Any other move is a `422` with `loc` `["body", "status"]` and `type` `status_not_allowed`, and nothing moves. Assess the story again to lift the restriction.
   - The evidence is stored with the move in the activity log (`detail.evidence`, with each file's name, type and size). Files are kept under `evidence/<story id>/` next to the database and deleted with their story or board. A file a move has used can't be deleted on its own.
   - Evidence files are `.html .xml .json .txt .log .pdf` reports or `.png .jpg .jpeg .gif .webp .mp4 .webm .mov` screenshots and recordings; the content type comes from the extension. `GET /api/evidence/{file_id}` serves images and videos inline and everything else as a download, always with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so an uploaded HTML report can't run scripts on the board.
+- **Tags** say what kind of work a story is, e.g. `backend`, `frontend`, `design`, `platform` or `security`. `POST /api/boards/{id}/stories` and `PUT /api/stories/{id}` take `tags`, a list of up to 10. Each is trimmed and lowercased and must then be 1–30 letters, digits and hyphens, starting with a letter or digit; anything else is a `422`. Duplicates are dropped and the order is kept. Any tag is allowed: there is no fixed list. Every story returns `tags`.
+  - Leaving `tags` out of `PUT /api/stories/{id}` keeps the current tags; `[]` clears them.
+  - Tags are not part of the assessment, so changing only the tags doesn't make the latest assessment stale. A change is logged as `story_edited` with `"tags"` in `fields`; a story created with tags has them in its `story_created` detail.
 - Every change to a board or story is written to an **activity log** in the same transaction: who made it (`actor_kind` `user` with `actor` `board` for the HTTP API, or `agent` with the agent's name for the [MCP server](#mcp-server-for-ai-agents)), what changed (`action` and `detail`, e.g. the columns of a move or the fields of an edit), the agent's `note`, and when. Saving unchanged text is not logged. A deleted story's entries keep its `story_key`. `GET /api/stories/{id}` returns the story's `activity`, newest first; `GET /api/boards/{id}/activity?limit=100` returns the whole board's.
 - Each story lists the `agents` that have changed it, oldest first. The list comes from the log, so editing a story can't remove it.
 - **Human-only stories** depend on a person: provisioning accounts, acquiring servers, an API another team is still building, or secrets and private keys. `PUT /api/stories/{id}/human-only` with `{"human_only": true|false}` sets or clears the tag, and every story returns `human_only`.
@@ -179,13 +182,13 @@ Other MCP clients take the same command: `uv run --directory /abs/path/story-ref
 | Tool | What it does |
 |---|---|
 | `list_boards` | Boards with `story_count` and `story_limit` |
-| `list_stories(board, status?)` | A board's stories: key, title, column, verdict, quality, stale, blocked reason, agents, human_only, parent_key |
+| `list_stories(board, status?, tag?)` | A board's stories: key, title, column, verdict, quality, stale, blocked reason, agents, human_only, parent_key, tags |
 | `get_story(story)` | Full text, the latest report (checks and questions for the author), assessment history and activity |
 | `get_activity(board, story?, limit?)` | The activity log, newest first |
 | `create_board(name, key_prefix, note, description?)` | New board |
 | `update_board(board, note, name?, description?)` | Rename a board or change its description |
-| `create_story(board, title, note, description?, acceptance_criteria?, definition_of_ready?, parent?)` | New story at the end of the backlog; `parent` splits it from a story on the same board (not a human-only one) |
-| `update_story(story, note, title?, description?, acceptance_criteria?, definition_of_ready?)` | Change only the given fields; marks the story stale |
+| `create_story(board, title, note, description?, acceptance_criteria?, definition_of_ready?, parent?, tags?)` | New story at the end of the backlog; `parent` splits it from a story on the same board (not a human-only one) |
+| `update_story(story, note, title?, description?, acceptance_criteria?, definition_of_ready?, tags?)` | Change only the given fields; `tags` replaces the whole list. A text change marks the story stale; a tags-only change doesn't |
 | `move_story(story, status, note, place?, blocked_reason?, done_evidence?)` | Move to the `top` or `bottom` (default) of a column; `blocked` needs a reason, entering `done` needs evidence |
 | `assess_story(story, note)` | Assess with Jev (one call) and save the report |
 

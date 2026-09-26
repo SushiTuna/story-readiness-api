@@ -499,8 +499,9 @@ paths:
     put:
       tags:
       - stories
-      summary: Replace a stored story's text
-      description: Earlier assessments are kept; the story is marked stale until it is assessed again.
+      summary: Replace a stored story's text and tags
+      description: Earlier assessments are kept. Changing the text marks the story stale until it is assessed
+        again; changing only the tags does not. Leave tags out to keep the current ones.
       operationId: updateStory
       parameters:
       - name: story_id
@@ -877,7 +878,7 @@ components:
           type: object
           additionalProperties: true
           title: Detail
-          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}. A move into done has an "evidence" object with test_reports, ui_change, ui_evidence and commits; each uploaded file's id, filename, content_type and size are under "file". A split story's story_created has "parent_key". story_human_only has {"human_only":true|false}, and "inherited_from" (the parent's key) when a split story inherited the tag.
+          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}. A move into done has an "evidence" object with test_reports, ui_change, ui_evidence and commits; each uploaded file's id, filename, content_type and size are under "file". A split story's story_created has "parent_key"; a story created with tags has "tags"; story_edited's "fields" can include "tags". story_human_only has {"human_only":true|false}, and "inherited_from" (the parent's key) when a split story inherited the tag.
         note:
           anyOf:
           - type: string
@@ -1544,6 +1545,12 @@ components:
           - type: 'null'
           title: Parent Key
           description: Key of the story it was split from, e.g. FLW-3, or null.
+        tags:
+          items:
+            type: string
+          type: array
+          title: Tags
+          description: Kind of work, e.g. backend or security; lowercase, in the order given.
         report:
           anyOf:
           - $ref: '#/components/schemas/ReportOut'
@@ -1583,6 +1590,7 @@ components:
       - human_only
       - parent_id
       - parent_key
+      - tags
       - report
       - history
       - activity
@@ -1680,6 +1688,12 @@ components:
           - type: 'null'
           title: Parent Key
           description: Key of the story it was split from, e.g. FLW-3, or null.
+        tags:
+          items:
+            type: string
+          type: array
+          title: Tags
+          description: Kind of work, e.g. backend or security; lowercase, in the order given.
       type: object
       required:
       - id
@@ -1701,6 +1715,7 @@ components:
       - human_only
       - parent_id
       - parent_key
+      - tags
       title: StoredStoryOut
     StoryCreateIn:
       properties:
@@ -1731,6 +1746,17 @@ components:
           title: Definition Of Ready
           description: Extra requirements from the team's Definition of Ready, one per item. Each becomes
             a yes/no check. Blank and duplicate items are dropped; at most 12 are used, each cut to 300 characters.
+        tags:
+          items:
+            type: string
+            maxLength: 30
+            pattern: ^[a-z0-9][a-z0-9-]*$
+          type: array
+          maxItems: 10
+          title: Tags
+          description: Kind of work, e.g. backend, frontend, design, platform or security. Each is trimmed and
+            lowercased; 1–30 letters, digits and hyphens. Duplicates are dropped. Tags don't affect the assessment.
+            When updating, leave tags out to keep the current ones.
         parent_id:
           anyOf:
           - type: string
@@ -1778,11 +1804,22 @@ components:
           title: Definition Of Ready
           description: Extra requirements from the team's Definition of Ready, one per item. Each becomes
             a yes/no check. Blank and duplicate items are dropped; at most 12 are used, each cut to 300 characters.
+        tags:
+          items:
+            type: string
+            maxLength: 30
+            pattern: ^[a-z0-9][a-z0-9-]*$
+          type: array
+          maxItems: 10
+          title: Tags
+          description: Kind of work, e.g. backend, frontend, design, platform or security. Each is trimmed and
+            lowercased; 1–30 letters, digits and hyphens. Duplicates are dropped. Tags don't affect the assessment.
+            When updating, leave tags out to keep the current ones.
       type: object
       required:
       - title
       title: StoryIn
-      description: A story to store. Same fields and limits as AssessRequest.
+      description: A story to store. Same fields and limits as AssessRequest, plus tags.
     StoryMoveIn:
       properties:
         status:

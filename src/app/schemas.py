@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import enum
+import re
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from pydantic_core import PydanticCustomError
 
 
@@ -181,8 +182,45 @@ class BoardOut(BaseModel):
 # Stored stories
 # ---------------------------------------------------------------------------
 
+MAX_TAGS = 10
+TAG_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
+_TAG_RE = re.compile(TAG_PATTERN)
+
+
+def _normalize_tag(value: object) -> object:
+    # Before the length check, so "  Backend " counts as "backend".
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+def _check_tag(value: str) -> str:
+    if not _TAG_RE.match(value):
+        raise PydanticCustomError(
+            "tag_invalid", "A tag is lowercase letters, digits and hyphens, starting with a letter or digit."
+        )
+    return value
+
+
+# Kind of work, e.g. backend, frontend, design, platform or security. Trimmed and lowercased before it is checked.
+Tag = Annotated[
+    str,
+    BeforeValidator(_normalize_tag),
+    Field(max_length=30, json_schema_extra={"pattern": TAG_PATTERN}),
+    AfterValidator(_check_tag),
+]
+
+
 class StoryIn(AssessRequest):
-    """A story to store. Same fields and limits as AssessRequest."""
+    """A story to store. Same fields and limits as AssessRequest, plus tags."""
+
+    # Duplicates are dropped by a field validator: assigning self.tags in a model validator would mark tags as sent,
+    # and the update route keeps the current tags only when they were left out.
+    tags: Annotated[list[Tag], AfterValidator(lambda tags: list(dict.fromkeys(tags)))] = Field(
+        default_factory=list,
+        max_length=MAX_TAGS,
+        description="Kind of work, e.g. backend, frontend, design, platform or security. Each is trimmed and "
+        "lowercased: 1–30 letters, digits and hyphens. Duplicates are dropped. Tags don't affect the assessment. "
+        "When updating, leave tags out to keep the current ones.",
+    )
 
 
 class StoryCreateIn(StoryIn):
@@ -325,8 +363,9 @@ class ActivityOut(BaseModel):
         description="Action-specific data, e.g. {\"fields\": [\"title\"]} or {\"from\": \"backlog\", \"to\": \"blocked\"}. "
         "A move into done has an \"evidence\" object: test_reports, ui_change, ui_evidence and commits, with each "
         "uploaded file's id, filename, content_type and size under \"file\". A split story's story_created has "
-        "\"parent_key\". story_human_only has {\"human_only\": true|false}, and \"inherited_from\" (the parent's key) "
-        "when a split story inherited the tag."
+        "\"parent_key\"; a story created with tags has \"tags\"; story_edited's \"fields\" can include \"tags\". "
+        "story_human_only has {\"human_only\": true|false}, and \"inherited_from\" (the parent's key) when a split "
+        "story inherited the tag."
     )
     note: str | None = Field(description="The agent's reason for the change, or null for UI changes.")
     story_key: str | None = Field(description="Human-readable story key, kept after the story is deleted.")
@@ -356,6 +395,9 @@ class StoredStoryOut(BaseModel):
     agents: list[str] = Field(default_factory=list, description="Names of agents that have acted on this story, oldest first.")
     human_only: bool = Field(
         description="Only people on the board may change the story; AI agents can't. Set with PUT …/human-only."
+    )
+    tags: list[str] = Field(
+        default_factory=list, description="Kind of work, e.g. backend or security; lowercase, in the order given."
     )
     parent_id: str | None = Field(description="ID of the story it was split from, or null.")
     parent_key: str | None = Field(description="Key of the story it was split from, e.g. FLW-3, or null.")

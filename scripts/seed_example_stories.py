@@ -24,7 +24,7 @@ DEFAULT_API = "http://127.0.0.1:8000"
 DEFAULT_BOARD_PREFIX = "EX"
 BOARD_NAME = "Example backlog"
 EXAMPLES = Path(__file__).resolve().parent / "example_stories.json"
-_FIELDS = ("title", "description", "acceptance_criteria", "definition_of_ready")
+_FIELDS = ("title", "description", "acceptance_criteria", "definition_of_ready", "tags")
 
 
 def _story_body(entry: dict) -> dict:

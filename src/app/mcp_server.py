@@ -71,6 +71,9 @@ Rules:
 - A story with human_only: true depends on a person: accounts, servers, another team's API, or secrets and
   private keys. You can read it, but you can't edit, move, assess or split it, and you can't set or clear the
   tag. Those calls are rejected. Leave it to the people on the board.
+- Stories can have up to 10 tags for the kind of work, e.g. backend, frontend, design, platform, security.
+  Tags are lowercase letters, digits and hyphens. Reuse the tags already on the board where they fit.
+  Changing only the tags doesn't make the assessment stale.
 - Stories have a human-readable key like FLW-12. You can use keys or IDs in all tools.
 - Boards are identified by ID or key prefix (e.g. "FLW").
 
@@ -185,18 +188,22 @@ def list_boards() -> list[BoardOut]:
     annotations=_READ_ONLY,
     description=(
         "List stories on a board. Returns a compact view: key, title, status, verdict, quality, "
-        "stale, blocked_reason, agents, human_only, parent_key. Human-only stories can be read but not changed. "
+        "stale, blocked_reason, agents, human_only, parent_key, tags. Human-only stories can be read but not changed. "
         "board: board ID or key prefix (e.g. 'FLW'). "
-        "status: optional filter, one of backlog/refinement/ready_for_sprint/in_sprint/done/blocked."
+        "status: optional filter, one of backlog/refinement/ready_for_sprint/in_sprint/done/blocked. "
+        "tag: optional filter, only stories with this tag (e.g. 'backend')."
     ),
 )
-def list_stories(board: str, status: Status | None = None) -> list[dict]:
+def list_stories(board: str, status: Status | None = None, tag: str | None = None) -> list[dict]:
     b = _resolve_board(board)
     pairs = story_store.list_stories(b.id)
     agents_map = story_store.agents_by_story(b.id)
+    wanted_tag = tag.strip().lower() if tag is not None else None
     result = []
     for story, recent in pairs:
         if status is not None and story.status != status:
+            continue
+        if wanted_tag is not None and wanted_tag not in story.tags:
             continue
         latest = recent[0] if recent else None
         result.append({
@@ -211,6 +218,7 @@ def list_stories(board: str, status: Status | None = None) -> list[dict]:
             "agents": agents_map.get(story.id, []),
             "human_only": story.human_only,
             "parent_key": story.parent_key,
+            "tags": story.tags,
         })
     return result
 
@@ -322,6 +330,8 @@ def update_board(
         "definition_of_ready: list of DoR items (max 50). "
         "parent: optional story ID or key on the same board to split this story from. A human-only story can't "
         "be split by an agent. "
+        "tags: optional list of up to 10 tags for the kind of work, e.g. ['backend', 'security']; lowercase "
+        "letters, digits and hyphens. "
         "note: required — why you are creating this story."
     ),
 )
@@ -334,6 +344,7 @@ def create_story(
     acceptance_criteria: str = "",
     definition_of_ready: list[str] | None = None,
     parent: str | None = None,
+    tags: list[str] | None = None,
 ) -> StoredStoryOut:
     note = _require_note(note)
     dor = definition_of_ready or []
@@ -345,6 +356,7 @@ def create_story(
             description=description,
             acceptance_criteria=acceptance_criteria,
             definition_of_ready=dor,
+            tags=tags or [],
         )
     except ValidationError as exc:
         raise _invalid(exc) from exc
@@ -368,6 +380,7 @@ def create_story(
             acceptance_criteria=body.acceptance_criteria,
             definition_of_ready=body.definition_of_ready,
             parent_id=parent_id,
+            tags=body.tags,
             actor=_actor(ctx, note),
         )
     except story_store.HumanOnlyError as exc:
@@ -386,9 +399,11 @@ def create_story(
 @_server.tool(
     annotations=_WRITE_IDEMPOTENT,
     description=(
-        "Update a story's text (partial — omit a field to keep its current value). "
-        "Marks the story stale until it is re-assessed. A human-only story can't be updated by an agent. "
+        "Update a story's text or tags (partial — omit a field to keep its current value). "
+        "Changing the text marks the story stale until it is re-assessed; changing only the tags does not. "
+        "A human-only story can't be updated by an agent. "
         "story: story ID or key (e.g. 'FLW-12'). "
+        "tags: the story's full new list of tags (replaces the current ones; [] clears them). "
         "note: required — why you are making this change."
     ),
 )
@@ -400,6 +415,7 @@ def update_story(
     description: str | None = None,
     acceptance_criteria: str | None = None,
     definition_of_ready: list[str] | None = None,
+    tags: list[str] | None = None,
 ) -> StoredStoryOut:
     note = _require_note(note)
     s = _resolve_story(story)
@@ -408,6 +424,7 @@ def update_story(
     merged_desc = description if description is not None else s.description
     merged_ac = acceptance_criteria if acceptance_criteria is not None else s.acceptance_criteria
     merged_dor = definition_of_ready if definition_of_ready is not None else s.definition_of_ready
+    merged_tags = tags if tags is not None else s.tags
     if is_too_large(merged_desc, merged_ac):
         raise ToolError("The story is longer than the size limit (10 000 chars per field).")
     try:
@@ -416,6 +433,7 @@ def update_story(
             description=merged_desc,
             acceptance_criteria=merged_ac,
             definition_of_ready=merged_dor,
+            tags=merged_tags,
         )
     except ValidationError as exc:
         raise _invalid(exc) from exc
@@ -426,6 +444,7 @@ def update_story(
             description=body.description,
             acceptance_criteria=body.acceptance_criteria,
             definition_of_ready=body.definition_of_ready,
+            tags=body.tags,
             actor=_actor(ctx, note),
         )
     except story_store.HumanOnlyError as exc:

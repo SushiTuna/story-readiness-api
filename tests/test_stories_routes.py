@@ -456,3 +456,46 @@ async def test_tagging_makes_the_latest_assessment_stale(client, monkeypatch):
     await client.post(f"/api/stories/{story['id']}/assess")
     resp = await client.put(f"/api/stories/{story['id']}/human-only", json={"human_only": True})
     assert resp.json()["stale"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+async def test_tags_are_trimmed_lowercased_and_deduplicated(client):
+    story = await _create(client, tags=[" Backend ", "SECURITY", "backend", "api-v2"])
+    assert story["tags"] == ["backend", "security", "api-v2"]
+    listed = (await client.get(_stories_url())).json()
+    assert listed[0]["tags"] == ["backend", "security", "api-v2"]
+    assert (await _create(client))["tags"] == []
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [["bad tag"], ["-leading-hyphen"], [""], ["x" * 31], [f"t{i}" for i in range(11)], [1]],
+)
+async def test_invalid_tags_are_422(client, tags):
+    resp = await client.post(_stories_url(), json={**_BODY, "tags": tags})
+    assert resp.status_code == 422
+
+
+async def test_update_without_tags_keeps_them_and_with_tags_replaces_them(client):
+    story = await _create(client, tags=["backend"])
+    url = f"/api/stories/{story['id']}"
+    kept = await client.put(url, json={**_BODY, "title": "Renamed"})
+    assert kept.status_code == 200 and kept.json()["tags"] == ["backend"]
+    replaced = await client.put(url, json={**_BODY, "title": "Renamed", "tags": ["Frontend"]})
+    assert replaced.json()["tags"] == ["frontend"]
+    cleared = await client.put(url, json={**_BODY, "title": "Renamed", "tags": []})
+    assert cleared.json()["tags"] == []
+
+
+async def test_changing_only_tags_keeps_the_verdict_current(client, monkeypatch):
+    _mock_assess(monkeypatch, 0.9)
+    story = await _create(client)
+    assert (await client.post(f"/api/stories/{story['id']}/assess")).status_code == 200
+    resp = await client.put(f"/api/stories/{story['id']}", json={**_BODY, "tags": ["platform"]})
+    assert (resp.json()["tags"], resp.json()["stale"]) == (["platform"], False)
+    detail = (await client.get(f"/api/stories/{story['id']}")).json()
+    assert detail["activity"][0]["action"] == "story_edited"
+    assert detail["activity"][0]["detail"] == {"fields": ["tags"]}

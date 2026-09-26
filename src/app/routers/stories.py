@@ -103,6 +103,7 @@ def _fields(story: StoredStory, recent: list[Assessment], agents: list[str] | No
         "human_only": story.human_only,
         "parent_id": story.parent_id,
         "parent_key": story.parent_key,
+        "tags": story.tags,
     }
 
 
@@ -112,6 +113,8 @@ def _story_kwargs(body: StoryIn) -> dict:
         "description": body.description,
         "acceptance_criteria": body.acceptance_criteria,
         "definition_of_ready": body.definition_of_ready,
+        # Left out: the story keeps its tags (a new story has none).
+        "tags": body.tags if "tags" in body.model_fields_set else None,
     }
 
 
@@ -204,8 +207,9 @@ def get_story(story_id: str) -> StoredStoryDetailOut | JSONResponse:
     "/stories/{story_id}",
     response_model=StoredStoryOut,
     operation_id="updateStory",
-    summary="Replace a stored story's text",
-    description="Earlier assessments are kept; the story is marked stale until it is assessed again.",
+    summary="Replace a stored story's text and tags",
+    description="Earlier assessments are kept. Changing the text marks the story stale until it is assessed again; "
+    "changing only the tags does not. Leave tags out to keep the current ones.",
     responses={**_NOT_FOUND, **_TOO_LARGE},
 )
 def update_story(story_id: str, body: StoryIn) -> StoredStoryOut | JSONResponse:
