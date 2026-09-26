@@ -624,3 +624,183 @@ def test_deleting_a_story_or_board_removes_its_evidence_files():
     path = story_store.evidence_path(story_store.save_evidence_file(other.id, "log.txt", b"1"))
     story_store.delete_board(board.id)
     assert not path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Human-only stories
+# ---------------------------------------------------------------------------
+
+_BOT = story_store.Actor("agent", "planner-bot", "Tidy up")
+
+
+def _story_log(story_id: str) -> list[tuple[str, str, str, dict]]:
+    """The story's activity, oldest first: (actor_kind, actor, action, detail)."""
+    entries = story_store.list_activity(_st_board().id, story_id=story_id)
+    return [(e.actor_kind, e.actor, e.action, e.detail) for e in reversed(entries)]
+
+
+def test_agents_cannot_change_a_human_only_story_in_any_way():
+    story = _create(human_only=True)
+    before = story_store.get_story(story.id)
+    attempts = {
+        "update": lambda: story_store.update_story(story.id, **{**_STORY, "title": "Changed"}, actor=_BOT),
+        "move": lambda: story_store.move_story(story.id, status="refinement", position=1, actor=_BOT),
+        "assess": lambda: story_store.add_assessment(story, _report(0.9), actor=_BOT),
+        "evidence": lambda: story_store.save_evidence_file(story.id, "report.txt", b"ok", actor=_BOT),
+        "delete": lambda: story_store.delete_story(story.id, actor=_BOT),
+    }
+    for name, attempt in attempts.items():
+        with pytest.raises(story_store.HumanOnlyError, match=r"^ST-1 is human-only: .*AI agents can't change it"):
+            attempt()
+
+    assert story_store.get_story(story.id) == before
+    assert story_store.list_assessments(story.id) == []
+    assert all(kind == "user" for kind, *_ in _story_log(story.id))
+
+
+def test_people_on_the_board_can_still_change_a_human_only_story():
+    story = _create(human_only=True)
+    assert story_store.update_story(story.id, **{**_STORY, "title": "Changed"}).title == "Changed"
+    assert story_store.move_story(story.id, status="refinement", position=1).status == "refinement"
+    story_store.add_assessment(story_store.get_story(story.id), _report(0.9))
+    assert story_store.save_evidence_file(story.id, "report.txt", b"ok") is not None
+    assert story_store.delete_story(story.id) is True
+
+
+def test_untagged_stories_are_unaffected_for_agents():
+    story = _create()
+    assert story_store.update_story(story.id, **{**_STORY, "title": "Changed"}, actor=_BOT).title == "Changed"
+    assert story_store.move_story(story.id, status="refinement", position=1, actor=_BOT).status == "refinement"
+
+
+def test_split_children_and_grandchildren_inherit_the_tag_and_log_it():
+    parent = _create(title="Provision staging DB creds", human_only=True)
+    child = _create(title="Create the DB user", parent_id=parent.id)
+    grandchild = _create(title="Store the password in the vault", parent_id=child.id)
+
+    for story, parent_key in ((child, "ST-1"), (grandchild, "ST-2")):
+        stored = story_store.get_story(story.id)
+        assert (stored.human_only, stored.parent_id, stored.parent_key) == (True, story.parent_id, parent_key)
+        assert _story_log(story.id) == [
+            ("user", "board", "story_created", {"title": story.title, "parent_key": parent_key}),
+            ("user", "board", "story_human_only", {"human_only": True, "inherited_from": parent_key}),
+        ]
+
+
+def test_clearing_the_parent_keeps_existing_children_tagged():
+    parent = _create(human_only=True)
+    child = _create(parent_id=parent.id)
+
+    cleared = story_store.set_human_only(parent.id, False)
+
+    assert cleared.human_only is False
+    assert story_store.get_story(child.id).human_only is True
+    # Inheritance is from the direct parent at creation: a new child of the cleared parent starts untagged.
+    assert _create(parent_id=parent.id).human_only is False
+
+
+def test_a_tagged_story_created_directly_logs_the_tag_without_inherited_from():
+    story = _create(human_only=True)
+    assert _story_log(story.id)[1] == ("user", "board", "story_human_only", {"human_only": True})
+
+
+def test_set_human_only_logs_who_changed_it_and_skips_no_ops():
+    story = _create()
+    story_store.set_human_only(story.id, False)  # already untagged: not logged
+    story_store.set_human_only(story.id, True)
+    story_store.set_human_only(story.id, True)  # already tagged: not logged
+    story_store.set_human_only(story.id, False)
+
+    assert [(kind, actor, action, detail) for kind, actor, action, detail in _story_log(story.id)[1:]] == [
+        ("user", "board", "story_human_only", {"human_only": True}),
+        ("user", "board", "story_human_only", {"human_only": False}),
+    ]
+    assert story_store.set_human_only("nope", True) is None
+
+
+def test_agents_cannot_set_or_clear_the_tag_or_split_a_human_only_story():
+    tagged = _create(human_only=True)
+    untagged = _create()
+    with pytest.raises(story_store.HumanOnlyError, match="Only people on the board"):
+        story_store.set_human_only(untagged.id, True, actor=_BOT)
+    with pytest.raises(story_store.HumanOnlyError, match="Only people on the board"):
+        story_store.set_human_only(tagged.id, False, actor=_BOT)
+    with pytest.raises(story_store.HumanOnlyError, match="Only people on the board"):
+        _create(human_only=True, actor=_BOT)
+    with pytest.raises(story_store.HumanOnlyError, match="ST-1 is human-only"):
+        _create(parent_id=tagged.id, actor=_BOT)
+
+    assert story_store.get_story(tagged.id).human_only is True
+    assert story_store.get_story(untagged.id).human_only is False
+    assert len(story_store.list_stories(_st_board().id)) == 2  # the refused split created nothing
+
+
+def test_agents_can_split_an_untagged_story():
+    parent = _create()
+    child = _create(parent_id=parent.id, actor=_BOT)
+    assert (child.human_only, child.parent_key) == (False, "ST-1")
+
+
+def test_a_parent_must_be_on_the_same_board():
+    other = story_store.create_board(name="Other", key_prefix="OT")
+    parent = _create(other.id)
+    with pytest.raises(story_store.ParentNotFoundError):
+        _create(parent_id=parent.id)
+    with pytest.raises(story_store.ParentNotFoundError):
+        _create(parent_id="nope")
+
+
+def test_deleting_a_parent_keeps_the_child_and_its_tag():
+    parent = _create(human_only=True)
+    child = _create(parent_id=parent.id)
+    story_store.delete_story(parent.id)
+    stored = story_store.get_story(child.id)
+    assert (stored.human_only, stored.parent_id, stored.parent_key) == (True, None, None)
+
+
+def test_untagged_fingerprints_are_unchanged_and_tagging_makes_the_assessment_stale():
+    from app.linear_client import issue_fingerprint
+
+    story = _create()
+    # The formula from before human-only existed: no untagged story may turn stale after the upgrade.
+    assert story.fingerprint == issue_fingerprint(
+        _STORY["title"], "\n".join([_STORY["description"], _STORY["acceptance_criteria"], *_STORY["definition_of_ready"]])
+    )
+    story_store.add_assessment(story, _report(0.9))
+    fresh = lambda: story_store.list_assessments(story.id)[0].fingerprint == story_store.get_story(story.id).fingerprint  # noqa: E731
+
+    assert fresh()
+    story_store.set_human_only(story.id, True)
+    assert not fresh()
+    story_store.set_human_only(story.id, False)
+    assert fresh()
+
+
+def test_set_human_only_does_not_touch_updated_at():
+    story = _create()
+    assert story_store.set_human_only(story.id, True).updated_at == story.updated_at
+
+
+def test_init_db_adds_human_only_and_parent_to_an_older_database(monkeypatch, tmp_path):
+    db = tmp_path / "old.db"
+    monkeypatch.setenv("STORIES_DB_PATH", str(db))
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE stories (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL,
+            acceptance_criteria TEXT NOT NULL, definition_of_ready TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'backlog', position REAL NOT NULL DEFAULT 0, number INTEGER,
+            blocked_reason TEXT);
+        INSERT INTO stories (id, title, description, acceptance_criteria, definition_of_ready, created_at, updated_at, number)
+        VALUES ('old-1', 'Old story', '', '', '[]', '2026-09-26T10:00:00+00:00', '2026-09-26T10:00:00+00:00', 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    story_store.init_db()
+
+    old = story_store.get_story("old-1")
+    assert (old.human_only, old.parent_id, old.parent_key) == (False, None, None)
+    assert story_store.set_human_only("old-1", True).human_only is True

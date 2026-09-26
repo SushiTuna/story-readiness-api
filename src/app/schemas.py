@@ -130,6 +130,11 @@ class ReportOut(BaseModel):
     request_id: str | None
     latency_ms: int | None
     input_tokens: int | None
+    agent_checks_skipped: bool = Field(
+        False,
+        description="The story is human-only, so the AI-agent readiness checks were not run and are not in `checks`, "
+        "the quality score or the verdict.",
+    )
 
 
 class SourceOut(BaseModel):
@@ -178,6 +183,28 @@ class BoardOut(BaseModel):
 
 class StoryIn(AssessRequest):
     """A story to store. Same fields and limits as AssessRequest."""
+
+
+class StoryCreateIn(StoryIn):
+    """A new story to store, optionally split from another story on the same board."""
+
+    parent_id: str | None = Field(
+        None,
+        description="ID of the story on the same board that this one is split from. A child of a human-only story "
+        "is human-only too.",
+    )
+    human_only: bool = Field(
+        False,
+        description="Only people on the board may change the story; AI agents can't. It skips the AI-agent readiness "
+        "checks.",
+    )
+
+
+class HumanOnlyIn(BaseModel):
+    human_only: bool = Field(
+        description="True: only people on the board may change the story; AI agents can't, and assessments skip the "
+        "AI-agent readiness checks. Stories split from it keep their tag when it is cleared."
+    )
 
 
 class EvidenceItemIn(BaseModel):
@@ -285,12 +312,21 @@ class ActivityOut(BaseModel):
     actor_kind: Literal["agent", "user"] = Field(description="`agent` for the MCP server, `user` for the HTTP API.")
     actor: str = Field(description="Agent name, or 'board' for the web UI.")
     action: Literal[
-        "board_created", "board_updated", "story_created", "story_edited", "story_moved", "story_assessed", "story_deleted"
+        "board_created",
+        "board_updated",
+        "story_created",
+        "story_edited",
+        "story_moved",
+        "story_assessed",
+        "story_deleted",
+        "story_human_only",
     ]
     detail: dict = Field(
         description="Action-specific data, e.g. {\"fields\": [\"title\"]} or {\"from\": \"backlog\", \"to\": \"blocked\"}. "
         "A move into done has an \"evidence\" object: test_reports, ui_change, ui_evidence and commits, with each "
-        "uploaded file's id, filename, content_type and size under \"file\"."
+        "uploaded file's id, filename, content_type and size under \"file\". A split story's story_created has "
+        "\"parent_key\". story_human_only has {\"human_only\": true|false}, and \"inherited_from\" (the parent's key) "
+        "when a split story inherited the tag."
     )
     note: str | None = Field(description="The agent's reason for the change, or null for UI changes.")
     story_key: str | None = Field(description="Human-readable story key, kept after the story is deleted.")
@@ -318,6 +354,11 @@ class StoredStoryOut(BaseModel):
     previous_quality: float | None = Field(description="Quality of the assessment before the latest one.")
     stale: bool = Field(description="The story was edited after its latest assessment.")
     agents: list[str] = Field(default_factory=list, description="Names of agents that have acted on this story, oldest first.")
+    human_only: bool = Field(
+        description="Only people on the board may change the story; AI agents can't. Set with PUT …/human-only."
+    )
+    parent_id: str | None = Field(description="ID of the story it was split from, or null.")
+    parent_key: str | None = Field(description="Key of the story it was split from, e.g. FLW-3, or null.")
 
 
 class StoredStoryDetailOut(StoredStoryOut):

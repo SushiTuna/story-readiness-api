@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS stories (
     position            REAL NOT NULL DEFAULT 0,          -- order within the column, ascending
     number              INTEGER,                          -- sequential key number (<prefix>-<number>), unique per board
     blocked_reason      TEXT,                             -- why it is blocked; only set while status = 'blocked'
-    board_id            TEXT REFERENCES boards(id) ON DELETE CASCADE
+    board_id            TEXT REFERENCES boards(id) ON DELETE CASCADE,
+    human_only          INTEGER NOT NULL DEFAULT 0,       -- 1: only people on the board may change it, never an agent
+    parent_id           TEXT REFERENCES stories(id) ON DELETE SET NULL  -- the story it was split from, same board
 );
 CREATE TABLE IF NOT EXISTS counters (
     name  TEXT PRIMARY KEY,  -- 'prefix:<key prefix>'
@@ -122,6 +124,14 @@ class EvidenceError(Exception):
 
 class ReadinessError(Exception):
     """The story's latest verdict keeps it in Backlog or Refinement until it is assessed again."""
+
+
+class HumanOnlyError(Exception):
+    """An AI agent tried to change a human-only story, or to set or clear the tag. Only people on the board may."""
+
+
+class ParentNotFoundError(Exception):
+    """The story to split from does not exist on the same board."""
 
 
 class EvidenceFileTypeError(Exception):
@@ -192,6 +202,9 @@ class StoredStory:
     blocked_reason: str | None = None
     board_id: str = ""
     key_prefix: str = LEGACY_KEY_PREFIX
+    human_only: bool = False
+    parent_id: str | None = None
+    parent_key: str | None = None
 
     @property
     def key(self) -> str:
@@ -199,7 +212,9 @@ class StoredStory:
 
     @property
     def fingerprint(self) -> str:
-        return story_fingerprint(self.title, self.description, self.acceptance_criteria, self.definition_of_ready)
+        return story_fingerprint(
+            self.title, self.description, self.acceptance_criteria, self.definition_of_ready, self.human_only
+        )
 
 
 @dataclass
@@ -241,9 +256,27 @@ class ActivityEntry:
     created_at: datetime
 
 
-def story_fingerprint(title: str, description: str, acceptance_criteria: str, definition_of_ready: list[str]) -> str:
+# Appended to a human-only story's fingerprint: its assessment skips the AI-agent checks, so tagging it (or clearing
+# the tag) makes the latest assessment stale. Untagged stories hash exactly as before, so none of them goes stale.
+_HUMAN_ONLY_MARK = "\x00human-only"
+
+
+def story_fingerprint(
+    title: str, description: str, acceptance_criteria: str, definition_of_ready: list[str], human_only: bool = False
+) -> str:
     """Hash of everything the assessment reads; a change marks the latest assessment stale."""
-    return issue_fingerprint(title, "\n".join([description, acceptance_criteria, *definition_of_ready]))
+    parts = [description, acceptance_criteria, *definition_of_ready]
+    if human_only:
+        parts.append(_HUMAN_ONLY_MARK)
+    return issue_fingerprint(title, "\n".join(parts))
+
+
+def human_only_message(story_key: str) -> str:
+    """Why an agent can't change a human-only story; the MCP server returns it as the tool error."""
+    return (
+        f"{story_key} is human-only: it depends on a person (accounts, servers, another team's API, or secrets), so AI "
+        "agents can't change it. Ask someone on the board to do it, or to clear the tag."
+    )
 
 
 def _db_path() -> Path:
@@ -268,8 +301,11 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-# Every story read joins its board for the key prefix.
-_SELECT_STORY = "SELECT stories.*, boards.key_prefix FROM stories JOIN boards ON boards.id = stories.board_id"
+# Every story read joins its board for the key prefix, and the story it was split from for that story's number.
+_SELECT_STORY = (
+    "SELECT stories.*, boards.key_prefix, parent.number AS parent_number FROM stories "
+    "JOIN boards ON boards.id = stories.board_id LEFT JOIN stories AS parent ON parent.id = stories.parent_id"
+)
 
 
 def _board(row: sqlite3.Row) -> Board:
@@ -298,7 +334,17 @@ def _story(row: sqlite3.Row) -> StoredStory:
         blocked_reason=row["blocked_reason"],
         board_id=row["board_id"],
         key_prefix=row["key_prefix"],
+        human_only=bool(row["human_only"]),
+        parent_id=row["parent_id"],
+        # A parent is always on the same board, so it shares the prefix.
+        parent_key=f"{row['key_prefix']}-{row['parent_number']}" if row["parent_number"] is not None else None,
     )
+
+
+def _refuse_agent(actor: Actor, row: sqlite3.Row) -> None:
+    """Raise HumanOnlyError if an agent tries to change a human-only story. Call inside the write transaction."""
+    if actor.kind == "agent" and row["human_only"]:
+        raise HumanOnlyError(human_only_message(f"{row['key_prefix']}-{row['number']}"))
 
 
 def _assessment(row: sqlite3.Row) -> Assessment:
@@ -384,6 +430,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE stories ADD COLUMN blocked_reason TEXT")
         if "board_id" not in columns:
             conn.execute("ALTER TABLE stories ADD COLUMN board_id TEXT REFERENCES boards(id) ON DELETE CASCADE")
+        if "human_only" not in columns:
+            conn.execute("ALTER TABLE stories ADD COLUMN human_only INTEGER NOT NULL DEFAULT 0")
+        if "parent_id" not in columns:
+            conn.execute("ALTER TABLE stories ADD COLUMN parent_id TEXT REFERENCES stories(id) ON DELETE SET NULL")
         # Stories from before boards existed move to one board whose prefix keeps their ST-<n> keys.
         if conn.execute("SELECT 1 FROM stories WHERE board_id IS NULL LIMIT 1").fetchone():
             legacy = conn.execute("SELECT id FROM boards WHERE key_prefix = ?", (LEGACY_KEY_PREFIX,)).fetchone()
@@ -542,13 +592,21 @@ def create_story(
     description: str,
     acceptance_criteria: str,
     definition_of_ready: list[str],
+    parent_id: str | None = None,
+    human_only: bool = False,
     actor: Actor = BOARD_USER,
 ) -> StoredStory:
     """Add a story to the end of a board's backlog.
 
-    Raises BoardNotFoundError if the board does not exist, and BoardFullError if it already holds
-    MAX_STORIES_PER_BOARD stories.
+    *parent_id* splits it from another story on the same board. A child of a human-only story is human-only too,
+    whatever *human_only* says; clearing the tag on the parent later leaves the child tagged.
+
+    Raises BoardNotFoundError if the board does not exist, BoardFullError if it already holds
+    MAX_STORIES_PER_BOARD stories, ParentNotFoundError if the parent is not on the board, and HumanOnlyError if an
+    agent asks for a human-only story or splits a human-only one.
     """
+    if actor.kind == "agent" and human_only:
+        raise HumanOnlyError("Only people on the board can mark a story human-only.")
     now = _now()
     story = StoredStory(
         id=str(uuid.uuid4()),
@@ -570,6 +628,19 @@ def create_story(
         if count >= MAX_STORIES_PER_BOARD:
             raise BoardFullError(board_id)
         story.key_prefix = board["key_prefix"]
+        inherited_from: str | None = None
+        if parent_id is not None:
+            parent = conn.execute(
+                f"{_SELECT_STORY} WHERE stories.id = ? AND stories.board_id = ?", (parent_id, board_id)
+            ).fetchone()
+            if parent is None:
+                raise ParentNotFoundError(parent_id)
+            _refuse_agent(actor, parent)
+            story.parent_id = parent_id
+            story.parent_key = f"{parent['key_prefix']}-{parent['number']}"
+            if parent["human_only"] and not human_only:
+                inherited_from = story.parent_key
+        story.human_only = human_only or inherited_from is not None
         # New stories go to the end of the board's backlog.
         (last,) = conn.execute(
             "SELECT MAX(position) FROM stories WHERE board_id = ? AND status = 'backlog'", (board_id,)
@@ -580,8 +651,8 @@ def create_story(
             """
             INSERT INTO stories
                 (id, title, description, acceptance_criteria, definition_of_ready, created_at, updated_at, status, position,
-                 number, board_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 number, board_id, human_only, parent_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 story.id,
@@ -595,8 +666,13 @@ def create_story(
                 story.position,
                 story.number,
                 story.board_id,
+                int(story.human_only),
+                story.parent_id,
             ),
         )
+        created: dict = {"title": title}
+        if story.parent_key is not None:
+            created["parent_key"] = story.parent_key
         _log_activity(
             conn,
             board_id=board_id,
@@ -604,9 +680,50 @@ def create_story(
             story_key=story.key,
             actor=actor,
             action="story_created",
-            detail={"title": title},
+            detail=created,
         )
+        if story.human_only:
+            tagged: dict = {"human_only": True}
+            if inherited_from is not None:
+                tagged["inherited_from"] = inherited_from
+            _log_activity(
+                conn,
+                board_id=board_id,
+                story_id=story.id,
+                story_key=story.key,
+                actor=actor,
+                action="story_human_only",
+                detail=tagged,
+            )
     return story
+
+
+def set_human_only(story_id: str, human_only: bool, actor: Actor = BOARD_USER) -> StoredStory | None:
+    """Set or clear a story's human-only tag. Only people on the board may: raises HumanOnlyError for an agent.
+
+    Changes no other story: children split from it keep their tag. Does not touch updated_at (the text is
+    unchanged), but the fingerprint changes, so the latest assessment turns stale. Setting the value it already has
+    is not logged. Returns None if the story does not exist.
+    """
+    if actor.kind == "agent":
+        raise HumanOnlyError("Only people on the board can set or clear the human-only tag.")
+    with _connect() as conn:
+        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if row is None:
+            return None
+        if bool(row["human_only"]) != human_only:
+            conn.execute("UPDATE stories SET human_only = ? WHERE id = ?", (int(human_only), story_id))
+            _log_activity(
+                conn,
+                board_id=row["board_id"],
+                story_id=story_id,
+                story_key=f"{row['key_prefix']}-{row['number']}",
+                actor=actor,
+                action="story_human_only",
+                detail={"human_only": human_only},
+            )
+            row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+    return _story(row)
 
 
 def get_story(story_id: str) -> StoredStory | None:
@@ -709,6 +826,7 @@ def update_story(
         old_row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
         if old_row is None:
             return None
+        _refuse_agent(actor, old_row)
         old = _story(old_row)
         changed = []
         if old.title != title:
@@ -762,6 +880,8 @@ def move_story(
     Entering the done column needs *done_evidence* (DoneEvidenceIn as a dict); moving within it does not, and no
     other move takes it. Its uploaded files must belong to the story and not be used yet. They are marked attached,
     and the evidence, with each file's name, type and size, goes into the activity entry. Raises EvidenceError.
+
+    Raises HumanOnlyError if an agent moves a human-only story.
     """
     if status not in STATUSES:
         raise ValueError(f"Unknown status: {status}")
@@ -771,6 +891,7 @@ def move_story(
         old_row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
         if old_row is None:
             return None
+        _refuse_agent(actor, old_row)
         old_status = old_row["status"]
         board_id = old_row["board_id"]
         story_key = f"{old_row['key_prefix']}-{old_row['number']}"
@@ -817,12 +938,16 @@ def move_story(
 
 
 def delete_story(story_id: str, actor: Actor = BOARD_USER) -> bool:
-    """Delete a story and, through ON DELETE CASCADE, its assessments. Returns False if it did not exist."""
+    """Delete a story and, through ON DELETE CASCADE, its assessments. Returns False if it did not exist.
+
+    Raises HumanOnlyError if an agent deletes a human-only story.
+    """
     with _connect() as conn:
         # Read the key first: the story's activity rows keep it after ON DELETE SET NULL clears their story_id.
         row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
         if row is None:
             return False
+        _refuse_agent(actor, row)
         board_id = row["board_id"]
         story_key = f"{row['key_prefix']}-{row['number']}"
         cur = conn.execute("DELETE FROM stories WHERE id = ?", (story_id,))
@@ -842,7 +967,10 @@ def delete_story(story_id: str, actor: Actor = BOARD_USER) -> bool:
 
 
 def add_assessment(story: StoredStory, report: ReportOut, actor: Actor = BOARD_USER) -> Assessment:
-    """Save *report* as the latest assessment of *story*, fingerprinting the text that was assessed."""
+    """Save *report* as the latest assessment of *story*, fingerprinting the text that was assessed.
+
+    Raises HumanOnlyError if an agent assesses a human-only story, and sqlite3.IntegrityError if the story was deleted.
+    """
     questions, _notes = author_questions(report)
     assessment = Assessment(
         story_id=story.id,
@@ -854,6 +982,10 @@ def add_assessment(story: StoredStory, report: ReportOut, actor: Actor = BOARD_U
         report_json=report.model_dump_json(by_alias=True),
     )
     with _connect() as conn:
+        # Look up board_id and story_key for the activity log, and check the tag in this transaction.
+        story_row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story.id,)).fetchone()
+        if story_row is not None:
+            _refuse_agent(actor, story_row)
         conn.execute(
             """
             INSERT INTO assessments (story_id, verdict, quality, question_count, fingerprint, report_json, created_at)
@@ -869,10 +1001,6 @@ def add_assessment(story: StoredStory, report: ReportOut, actor: Actor = BOARD_U
                 assessment.created_at.isoformat(),
             ),
         )
-        # Look up board_id and story_key for the activity log.
-        story_row = conn.execute(
-            f"{_SELECT_STORY} WHERE stories.id = ?", (story.id,)
-        ).fetchone()
         if story_row is not None:
             _log_activity(
                 conn,
@@ -937,10 +1065,11 @@ def evidence_content_type(filename: str) -> str:
     return content_type
 
 
-def save_evidence_file(story_id: str, filename: str, data: bytes) -> EvidenceFile | None:
+def save_evidence_file(story_id: str, filename: str, data: bytes, actor: Actor = BOARD_USER) -> EvidenceFile | None:
     """Store an uploaded evidence file for a story; a move to Done can then use it by ID.
 
-    Returns None if the story does not exist. Raises EvidenceFileTypeError and EvidenceFileTooLargeError.
+    Returns None if the story does not exist. Raises EvidenceFileTypeError, EvidenceFileTooLargeError, and
+    HumanOnlyError if an agent uploads for a human-only story.
     """
     name = Path(filename.replace("\\", "/")).name.strip()[:200] or "evidence"
     content_type = evidence_content_type(name)
@@ -951,8 +1080,10 @@ def save_evidence_file(story_id: str, filename: str, data: bytes) -> EvidenceFil
         created_at=_now(),
     )
     with _connect() as conn:
-        if conn.execute("SELECT 1 FROM stories WHERE id = ?", (story_id,)).fetchone() is None:
+        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if row is None:
             return None
+        _refuse_agent(actor, row)
         conn.execute(
             """
             INSERT INTO evidence_files (id, story_id, filename, content_type, size, created_at)

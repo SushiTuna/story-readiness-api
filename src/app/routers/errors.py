@@ -51,6 +51,12 @@ def status_not_allowed(message: str) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": [error]})
 
 
+def parent_invalid(message: str) -> JSONResponse:
+    """422 for a split whose parent is not on the board, in the same shape as a request validation error."""
+    error = {"loc": ["body", "parent_id"], "msg": message, "type": "parent_invalid"}
+    return JSONResponse(status_code=422, content={"detail": [error]})
+
+
 def evidence_not_found() -> JSONResponse:
     return _error(404, "The evidence file was not found.")
 

@@ -639,3 +639,46 @@ async def test_unsure_agent_check_gives_discuss(monkeypatch):
 
     assert report.verdict == "discuss"
     assert "agent_code_context" in report.to_discuss
+
+
+# ---------------------------------------------------------------------------
+# Human-only stories skip the AI-agent readiness checks
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_skip_agent_checks_neither_asks_nor_scores_them(monkeypatch):
+    """A human-only story's agent answers would all fail, yet the verdict is ready: they are not asked or scored."""
+    answers = _all_pass_answers("user_feature")
+    answers.update({check_id: _noul(0.0) for check_id in _AGENT_CHECKS})
+    asked: list[set[str]] = []
+
+    async def mock_call_jev(state, questions, **_):
+        asked.append(set(questions))
+        return _jev_response({k: v for k, v in answers.items() if k in questions})
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+    report = await assess(_make_request(), source="paste", skip_agent_checks=True)
+
+    assert asked[0].isdisjoint(AGENT_CHECK_IDS)
+    assert not any(c.id in AGENT_CHECK_IDS for c in report.checks)
+    assert report.agent_checks_skipped is True
+    assert report.verdict == "ready"
+    assert report.quality == 1.0
+
+
+@pytest.mark.asyncio
+async def test_untagged_story_still_runs_and_is_capped_by_agent_checks(monkeypatch):
+    """Without the flag nothing changes: the four agent checks are asked, scored, and cap the verdict."""
+    answers = _all_pass_answers("user_feature")
+    answers["agent_self_contained"] = _noul(0.0)
+
+    async def mock_call_jev(state, questions, **_):
+        assert AGENT_CHECK_IDS <= set(questions)
+        return _jev_response(answers)
+
+    monkeypatch.setattr("app.engine.call_jev", mock_call_jev)
+    report = await assess(_make_request(), source="paste")
+
+    assert {c.id for c in report.checks} >= AGENT_CHECK_IDS
+    assert report.agent_checks_skipped is False
+    assert report.verdict == "needs_refinement"

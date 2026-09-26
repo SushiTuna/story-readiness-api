@@ -24,6 +24,7 @@ from app.routers.errors import (
     evidence_too_large,
     evidence_type_not_allowed,
     jev_unavailable,
+    parent_invalid,
     status_not_allowed,
     too_large,
 )
@@ -33,9 +34,11 @@ from app.schemas import (
     AssessRequest,
     ErrorOut,
     EvidenceFileOut,
+    HumanOnlyIn,
     ReportOut,
     StoredStoryDetailOut,
     StoredStoryOut,
+    StoryCreateIn,
     StoryIn,
     StoryMoveIn,
 )
@@ -97,6 +100,9 @@ def _fields(story: StoredStory, recent: list[Assessment], agents: list[str] | No
         "previous_quality": recent[1].quality if len(recent) > 1 else None,
         "stale": latest is not None and latest.fingerprint != story.fingerprint,
         "agents": agents if agents is not None else [],
+        "human_only": story.human_only,
+        "parent_id": story.parent_id,
+        "parent_key": story.parent_key,
     }
 
 
@@ -151,19 +157,24 @@ def list_board_activity(
     operation_id="createStory",
     summary="Store a pasted story on a board",
     description=f"Adds the story to the end of the board's backlog. A board holds at most "
-    f"{story_store.MAX_STORIES_PER_BOARD} stories, counting every column.",
+    f"{story_store.MAX_STORIES_PER_BOARD} stories, counting every column. With parent_id it is split from another "
+    "story on the board; a child of a human-only story is human-only too.",
     responses={**_BOARD_NOT_FOUND, **_BOARD_FULL, **_TOO_LARGE},
 )
-def create_story(board_id: str, body: StoryIn) -> StoredStoryOut | JSONResponse:
+def create_story(board_id: str, body: StoryCreateIn) -> StoredStoryOut | JSONResponse:
     oversized = too_large(body.description, body.acceptance_criteria)
     if oversized is not None:
         return oversized
     try:
-        story = story_store.create_story(board_id, **_story_kwargs(body))
+        story = story_store.create_story(
+            board_id, **_story_kwargs(body), parent_id=body.parent_id, human_only=body.human_only
+        )
     except story_store.BoardNotFoundError:
         return board_not_found()
     except story_store.BoardFullError:
         return board_full()
+    except story_store.ParentNotFoundError:
+        return parent_invalid("The story to split from was not found on this board.")
     return StoredStoryOut(**_fields(story, []))
 
 
@@ -238,6 +249,27 @@ def move_story(story_id: str, body: StoryMoveIn) -> StoredStoryOut | JSONRespons
         return _not_found()
     recent = story_store.list_assessments(story_id)[:2]
     return StoredStoryOut(**_fields(story, recent))
+
+
+@router.put(
+    "/stories/{story_id}/human-only",
+    response_model=StoredStoryOut,
+    operation_id="setStoryHumanOnly",
+    summary="Set or clear a stored story's human-only tag",
+    description=(
+        "A human-only story depends on a person (accounts, servers, another team's API, or secrets): AI agents using "
+        "the MCP server can read it but not change it, and assessments skip the AI-agent readiness checks. Only this "
+        "API sets or clears the tag. Stories already split from it keep theirs. The latest assessment turns stale."
+    ),
+    responses=_NOT_FOUND,
+)
+def set_human_only(story_id: str, body: HumanOnlyIn) -> StoredStoryOut | JSONResponse:
+    story = story_store.set_human_only(story_id, body.human_only)
+    if story is None:
+        return _not_found()
+    recent = story_store.list_assessments(story_id)[:2]
+    agents_map = story_store.agents_by_story(story.board_id)
+    return StoredStoryOut(**_fields(story, recent, agents_map.get(story_id, [])))
 
 
 @router.post(
@@ -362,7 +394,7 @@ async def assess_stored_story(story_id: str) -> ReportOut | JSONResponse:
         definition_of_ready=story.definition_of_ready,
     )
     try:
-        report = await engine.assess(request, source="paste")
+        report = await engine.assess(request, source="paste", skip_agent_checks=story.human_only)
     except JevError as exc:
         logger.error("Upstream TypeSafe error: %s", exc.detail)
         return jev_unavailable()

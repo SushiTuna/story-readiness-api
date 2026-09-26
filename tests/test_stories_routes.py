@@ -39,8 +39,8 @@ def _mock_assess(monkeypatch, *qualities: float) -> list:
     seen = []
     remaining = list(qualities)
 
-    async def fake(body, *, source):
-        seen.append((body, source))
+    async def fake(body, *, source, skip_agent_checks=False):
+        seen.append((body, source, skip_agent_checks))
         report = _make_report()
         report.quality = remaining.pop(0)
         return report
@@ -98,7 +98,7 @@ async def test_assess_saves_history_and_previous_quality(client, monkeypatch):
     second = await client.post(f"/api/stories/{story['id']}/assess")
     assert second.json()["quality"] == 0.96
 
-    body, source = seen[0]
+    body, source, _ = seen[0]
     assert source == "paste"
     assert body.definition_of_ready == ["Security impact is described"]
 
@@ -136,7 +136,7 @@ async def test_delete_is_204_and_removes_story(client):
 
 
 async def test_assess_jev_error_is_502_and_saves_nothing(client, monkeypatch):
-    async def failing(body, *, source):
+    async def failing(body, *, source, skip_agent_checks=False):
         raise JevError(503, "boom")
 
     monkeypatch.setattr("app.engine.assess", failing)
@@ -150,7 +150,7 @@ async def test_assess_jev_error_is_502_and_saves_nothing(client, monkeypatch):
 async def test_assess_story_deleted_during_assessment_is_404(client, monkeypatch):
     story = await _create(client)
 
-    async def delete_then_report(body, *, source):
+    async def delete_then_report(body, *, source, skip_agent_checks=False):
         await client.delete(f"/api/stories/{story['id']}")
         return _make_report()
 
@@ -181,7 +181,7 @@ async def test_move_unknown_story_is_404_and_bad_status_is_422(client):
 
 
 async def test_move_out_of_refinement_with_a_discuss_verdict_is_422(client, monkeypatch):
-    async def discuss(body, *, source):
+    async def discuss(body, *, source, skip_agent_checks=False):
         report = _make_report()
         report.verdict = VerdictEnum.discuss
         return report
@@ -390,3 +390,69 @@ async def test_board_activity_endpoint(client):
     missing = await client.get("/api/boards/nope/activity")
     assert missing.status_code == 404
     assert missing.json() == {"detail": "The board was not found."}
+
+
+# ---------------------------------------------------------------------------
+# Human-only stories
+# ---------------------------------------------------------------------------
+
+async def test_new_stories_are_untagged_and_have_no_parent(client):
+    story = await _create(client)
+    assert (story["human_only"], story["parent_id"], story["parent_key"]) == (False, None, None)
+
+
+async def test_set_and_clear_human_only_is_logged_as_the_board(client):
+    story = await _create(client)
+    url = f"/api/stories/{story['id']}/human-only"
+
+    tagged = await client.put(url, json={"human_only": True})
+    assert tagged.status_code == 200 and tagged.json()["human_only"] is True
+    cleared = await client.put(url, json={"human_only": False})
+    assert cleared.json()["human_only"] is False
+
+    activity = (await client.get(f"/api/stories/{story['id']}")).json()["activity"]
+    assert [(a["actor_kind"], a["actor"], a["action"], a["detail"]) for a in activity[:2]] == [
+        ("user", "board", "story_human_only", {"human_only": False}),
+        ("user", "board", "story_human_only", {"human_only": True}),
+    ]
+    assert (await client.put("/api/stories/nope/human-only", json={"human_only": True})).status_code == 404
+    assert (await client.put(url, json={})).status_code == 422
+
+
+async def test_split_child_inherits_human_only(client):
+    parent = await _create(client, title="Provision staging DB creds", human_only=True)
+    child = await _create(client, title="Create the DB user", parent_id=parent["id"])
+    assert (child["human_only"], child["parent_id"], child["parent_key"]) == (True, parent["id"], "ST-1")
+
+    activity = (await client.get(f"/api/stories/{child['id']}")).json()["activity"]
+    assert activity[0]["detail"] == {"human_only": True, "inherited_from": "ST-1"}
+    assert activity[1]["detail"] == {"title": "Create the DB user", "parent_key": "ST-1"}
+
+
+async def test_split_from_a_story_on_another_board_is_422(client):
+    url = _stories_url()
+    other = story_store.create_board(name="Other", key_prefix="OT")
+    foreign = story_store.create_story(
+        other.id, title="X", description="", acceptance_criteria="", definition_of_ready=[]
+    )
+    resp = await client.post(url, json={**_BODY, "parent_id": foreign.id})
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "parent_id"]
+    assert resp.json()["detail"][0]["type"] == "parent_invalid"
+
+
+async def test_assess_skips_agent_checks_only_for_human_only_stories(client, monkeypatch):
+    seen = _mock_assess(monkeypatch, 0.9, 0.9)
+    untagged = await _create(client)
+    tagged = await _create(client, human_only=True)
+    await client.post(f"/api/stories/{untagged['id']}/assess")
+    await client.post(f"/api/stories/{tagged['id']}/assess")
+    assert [skip for _, _, skip in seen] == [False, True]
+
+
+async def test_tagging_makes_the_latest_assessment_stale(client, monkeypatch):
+    _mock_assess(monkeypatch, 0.9)
+    story = await _create(client)
+    await client.post(f"/api/stories/{story['id']}/assess")
+    resp = await client.put(f"/api/stories/{story['id']}/human-only", json={"human_only": True})
+    assert resp.json()["stale"] is True

@@ -65,6 +65,7 @@ PYTHONPATH=src uv run pytest -v
 | `PUT` `DELETE` | `/api/boards/{id}` | Rename a board or edit its description, or delete it with all its stories |
 | `GET` `POST` | `/api/boards/{id}/stories` | List a board's stored stories, or store a pasted story on it (at most 100 per board) |
 | `GET` `PUT` `DELETE` | `/api/stories/{id}` | Read (with latest report and history), edit or delete a stored story |
+| `PUT` | `/api/stories/{id}/human-only` | Set or clear a stored story's human-only tag (only people on the board; never agents) |
 | `PUT` | `/api/stories/{id}/move` | Move a stored story to a workflow column and position (board drag and drop); entering Done needs evidence |
 | `POST` | `/api/stories/{id}/evidence` | Upload a test report, screenshot or recording for a move to Done (multipart, at most 50 MB) |
 | `GET` `DELETE` | `/api/evidence/{file_id}` | Download an evidence file, or delete one no move has used yet |
@@ -131,7 +132,13 @@ Pasted stories can be kept in a SQLite database (`STORIES_DB_PATH`, created on s
   - Evidence files are `.html .xml .json .txt .log .pdf` reports or `.png .jpg .jpeg .gif .webp .mp4 .webm .mov` screenshots and recordings; the content type comes from the extension. `GET /api/evidence/{file_id}` serves images and videos inline and everything else as a download, always with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so an uploaded HTML report can't run scripts on the board.
 - Every change to a board or story is written to an **activity log** in the same transaction: who made it (`actor_kind` `user` with `actor` `board` for the HTTP API, or `agent` with the agent's name for the [MCP server](#mcp-server-for-ai-agents)), what changed (`action` and `detail`, e.g. the columns of a move or the fields of an edit), the agent's `note`, and when. Saving unchanged text is not logged. A deleted story's entries keep its `story_key`. `GET /api/stories/{id}` returns the story's `activity`, newest first; `GET /api/boards/{id}/activity?limit=100` returns the whole board's.
 - Each story lists the `agents` that have changed it, oldest first. The list comes from the log, so editing a story can't remove it.
-- Like the rest of `/api/*`, these endpoints have no authentication. Anyone who can reach the server can read and delete stored stories.
+- **Human-only stories** depend on a person: provisioning accounts, acquiring servers, an API another team is still building, or secrets and private keys. `PUT /api/stories/{id}/human-only` with `{"human_only": true|false}` sets or clears the tag, and every story returns `human_only`.
+  - AI agents can read a human-only story over MCP but can't edit, move, assess or split it, can't upload evidence for it, and can't set or clear the tag. The store checks this in the same transaction as the write, so a tag set while an agent is working still holds. The agent gets the reason, for example `FLW-3 is human-only: it depends on a person (accounts, servers, another team's API, or secrets), so AI agents can't change it. Ask someone on the board to do it, or to clear the tag.`
+  - Assessing a human-only story skips the four AI-agent readiness checks: they are not asked, not in the quality score and can't cap the verdict. The report says `agent_checks_skipped: true`. Untagged stories are scored exactly as before.
+  - Setting or clearing the tag makes the latest assessment stale. Moving is not affected: the column rules are the same as for any story.
+  - `POST /api/boards/{id}/stories` takes an optional `parent_id` (a story on the same board, else a `422` with `loc` `["body", "parent_id"]`) to split a story, and `human_only`. A child of a human-only story is human-only too, and so are its own children. Clearing the tag on a parent later leaves existing children tagged. Stories return `parent_id` and `parent_key`.
+  - Each change is logged as `story_human_only` with `{"human_only": true|false}`, and `"inherited_from"` when a split story inherited it, with who made it. Setting the value it already has is not logged.
+- Like the rest of `/api/*`, these endpoints have no authentication. Anyone who can reach the server can read and delete stored stories. This includes the human-only tag: it keeps MCP agents out, but not a client that calls the HTTP API directly.
 
 #### Example backlog
 
@@ -172,18 +179,19 @@ Other MCP clients take the same command: `uv run --directory /abs/path/story-ref
 | Tool | What it does |
 |---|---|
 | `list_boards` | Boards with `story_count` and `story_limit` |
-| `list_stories(board, status?)` | A board's stories: key, title, column, verdict, quality, stale, blocked reason, agents |
+| `list_stories(board, status?)` | A board's stories: key, title, column, verdict, quality, stale, blocked reason, agents, human_only, parent_key |
 | `get_story(story)` | Full text, the latest report (checks and questions for the author), assessment history and activity |
 | `get_activity(board, story?, limit?)` | The activity log, newest first |
 | `create_board(name, key_prefix, note, description?)` | New board |
 | `update_board(board, note, name?, description?)` | Rename a board or change its description |
-| `create_story(board, title, note, description?, acceptance_criteria?, definition_of_ready?)` | New story at the end of the backlog |
+| `create_story(board, title, note, description?, acceptance_criteria?, definition_of_ready?, parent?)` | New story at the end of the backlog; `parent` splits it from a story on the same board (not a human-only one) |
 | `update_story(story, note, title?, description?, acceptance_criteria?, definition_of_ready?)` | Change only the given fields; marks the story stale |
 | `move_story(story, status, note, place?, blocked_reason?, done_evidence?)` | Move to the `top` or `bottom` (default) of a column; `blocked` needs a reason, entering `done` needs evidence |
 | `assess_story(story, note)` | Assess with Jev (one call) and save the report |
 
 - `board` is a board id or key prefix (`FLW`); `story` is a story id or key (`FLW-12`).
 - There are no delete tools.
+- **Human-only stories are read-only for agents.** `update_story`, `move_story`, `assess_story` and splitting with `create_story(parent=…)` are rejected with the reason, before any evidence is uploaded or Jev is called. No tool sets or clears the tag.
 - The same limits and rules as the HTTP API apply (100 stories per board, text size limit, the blocked reason, the evidence for Done, Discuss and Needs refinement stories staying in Backlog and Refinement).
 - `done_evidence` takes the same fields as the HTTP API, except that a report or screenshot/recording gives an absolute local file `path` (read and uploaded by the tool) or a `url` instead of a `file_id`. For example: `{"test_reports": [{"kind": "unit", "path": "/abs/path/junit.xml", "caption": "42 passed"}], "ui_change": false, "commits": [{"hash": "a53287d", "message": "feat: scaffold the monorepo"}]}`. If the move is refused, the files it uploaded are deleted again.
 - **Every write needs a `note`** (1–500 characters) that says why. The change is logged under the agent's name with that note, and the agent's name is shown on the story's card on the board.

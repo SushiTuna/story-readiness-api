@@ -68,6 +68,9 @@ Rules:
   cucumber) as a local file path or a URL, ui_change (true if the story changes the UI; then at least one
   screenshot or recording), and at least one commit (hash and message). The evidence is attached to the
   story's activity log. Do not move a story to done without real evidence.
+- A story with human_only: true depends on a person: accounts, servers, another team's API, or secrets and
+  private keys. You can read it, but you can't edit, move, assess or split it, and you can't set or clear the
+  tag. Those calls are rejected. Leave it to the people on the board.
 - Stories have a human-readable key like FLW-12. You can use keys or IDs in all tools.
 - Boards are identified by ID or key prefix (e.g. "FLW").
 
@@ -122,6 +125,15 @@ def _resolve_story(story_ref: str) -> story_store.StoredStory:
     return s
 
 
+def _refuse_human_only(story: story_store.StoredStory) -> None:
+    """Reject any agent change to a human-only story before doing work (uploads, Jev calls).
+
+    The store checks again inside its write transaction, so a tag set in the meantime still holds.
+    """
+    if story.human_only:
+        raise ToolError(story_store.human_only_message(story.key))
+
+
 def _require_note(note: str | None) -> str:
     if not note or not note.strip():
         raise ToolError("note is required. Explain why you are making this change (1–500 characters).")
@@ -173,7 +185,7 @@ def list_boards() -> list[BoardOut]:
     annotations=_READ_ONLY,
     description=(
         "List stories on a board. Returns a compact view: key, title, status, verdict, quality, "
-        "stale, blocked_reason, agents. "
+        "stale, blocked_reason, agents, human_only, parent_key. Human-only stories can be read but not changed. "
         "board: board ID or key prefix (e.g. 'FLW'). "
         "status: optional filter, one of backlog/refinement/ready_for_sprint/in_sprint/done/blocked."
     ),
@@ -197,6 +209,8 @@ def list_stories(board: str, status: Status | None = None) -> list[dict]:
             "stale": latest is not None and latest.fingerprint != story.fingerprint,
             "blocked_reason": story.blocked_reason,
             "agents": agents_map.get(story.id, []),
+            "human_only": story.human_only,
+            "parent_key": story.parent_key,
         })
     return result
 
@@ -306,6 +320,8 @@ def update_board(
         "description: story body (max 10 000 chars). "
         "acceptance_criteria: acceptance criteria (max 10 000 chars). "
         "definition_of_ready: list of DoR items (max 50). "
+        "parent: optional story ID or key on the same board to split this story from. A human-only story can't "
+        "be split by an agent. "
         "note: required — why you are creating this story."
     ),
 )
@@ -317,6 +333,7 @@ def create_story(
     description: str = "",
     acceptance_criteria: str = "",
     definition_of_ready: list[str] | None = None,
+    parent: str | None = None,
 ) -> StoredStoryOut:
     note = _require_note(note)
     dor = definition_of_ready or []
@@ -332,6 +349,17 @@ def create_story(
     except ValidationError as exc:
         raise _invalid(exc) from exc
     b = _resolve_board(board)
+    parent_id: str | None = None
+    if parent is not None:
+        p = _resolve_story(parent)
+        if p.board_id != b.id:
+            raise ToolError(f"Story {p.key} is not on board {b.key_prefix}; split a story on the same board.")
+        if p.human_only:
+            raise ToolError(
+                f"{story_store.human_only_message(p.key)} Stories split from it are human-only too, so only people "
+                "on the board can create them."
+            )
+        parent_id = p.id
     try:
         s = story_store.create_story(
             b.id,
@@ -339,8 +367,13 @@ def create_story(
             description=body.description,
             acceptance_criteria=body.acceptance_criteria,
             definition_of_ready=body.definition_of_ready,
+            parent_id=parent_id,
             actor=_actor(ctx, note),
         )
+    except story_store.HumanOnlyError as exc:
+        raise ToolError(str(exc)) from exc
+    except story_store.ParentNotFoundError:
+        raise ToolError(f"Story not found on board {b.key_prefix}: {parent!r}.")
     except story_store.BoardNotFoundError:
         raise ToolError(f"Board not found: {board!r}.")
     except story_store.BoardFullError:
@@ -354,7 +387,7 @@ def create_story(
     annotations=_WRITE_IDEMPOTENT,
     description=(
         "Update a story's text (partial — omit a field to keep its current value). "
-        "Marks the story stale until it is re-assessed. "
+        "Marks the story stale until it is re-assessed. A human-only story can't be updated by an agent. "
         "story: story ID or key (e.g. 'FLW-12'). "
         "note: required — why you are making this change."
     ),
@@ -370,6 +403,7 @@ def update_story(
 ) -> StoredStoryOut:
     note = _require_note(note)
     s = _resolve_story(story)
+    _refuse_human_only(s)
     merged_title = title if title is not None else s.title
     merged_desc = description if description is not None else s.description
     merged_ac = acceptance_criteria if acceptance_criteria is not None else s.acceptance_criteria
@@ -385,14 +419,17 @@ def update_story(
         )
     except ValidationError as exc:
         raise _invalid(exc) from exc
-    updated = story_store.update_story(
-        s.id,
-        title=body.title,
-        description=body.description,
-        acceptance_criteria=body.acceptance_criteria,
-        definition_of_ready=body.definition_of_ready,
-        actor=_actor(ctx, note),
-    )
+    try:
+        updated = story_store.update_story(
+            s.id,
+            title=body.title,
+            description=body.description,
+            acceptance_criteria=body.acceptance_criteria,
+            definition_of_ready=body.definition_of_ready,
+            actor=_actor(ctx, note),
+        )
+    except story_store.HumanOnlyError as exc:
+        raise ToolError(str(exc)) from exc
     if updated is None:
         raise ToolError(f"Story not found: {story!r}.")
     return _out(updated)
@@ -456,13 +493,13 @@ def _read_evidence_file(path_str: str) -> tuple[str, bytes]:
     return path.name, path.read_bytes()
 
 
-def _upload_paths(story_id: str, evidence: DoneEvidenceIn, saved: list[str]) -> None:
+def _upload_paths(story_id: str, evidence: DoneEvidenceIn, saved: list[str], actor: story_store.Actor) -> None:
     """Upload every path standing in as a file_id and swap in the real ID. Appends each new file's ID to *saved*."""
     for entry in [*evidence.test_reports, *evidence.ui_evidence]:
         if entry.file_id is None:
             continue
         name, data = _read_evidence_file(entry.file_id)
-        file = story_store.save_evidence_file(story_id, name, data)
+        file = story_store.save_evidence_file(story_id, name, data, actor=actor)
         if file is None:
             raise ToolError("Story not found.")
         saved.append(file.id)
@@ -481,6 +518,7 @@ def _upload_paths(story_id: str, evidence: DoneEvidenceIn, saved: list[str]) -> 
         "until it is assessed again. "
         "done_evidence: required when moving INTO 'done'; not allowed otherwise. Test reports and "
         "screenshots/recordings are absolute local file paths (uploaded for you) or URLs. "
+        "A human-only story can't be moved by an agent. "
         "note: required — why you are moving this story."
     ),
 )
@@ -495,6 +533,7 @@ def move_story(
 ) -> StoredStoryOut:
     note = _require_note(note)
     s = _resolve_story(story)
+    _refuse_human_only(s)  # before any evidence file is read or uploaded
     evidence = _evidence_in(done_evidence) if done_evidence is not None else None
     # Validate via Pydantic so the Blocked and Done rules fire.
     try:
@@ -520,7 +559,7 @@ def move_story(
     saved: list[str] = []
     try:
         if evidence is not None:
-            _upload_paths(s.id, evidence, saved)
+            _upload_paths(s.id, evidence, saved, _actor(ctx, note))
         updated = story_store.move_story(
             s.id,
             status=body.status,
@@ -529,7 +568,7 @@ def move_story(
             done_evidence=evidence.model_dump() if evidence is not None else None,
             actor=_actor(ctx, note),
         )
-    except (story_store.EvidenceError, story_store.ReadinessError) as exc:
+    except (story_store.EvidenceError, story_store.ReadinessError, story_store.HumanOnlyError) as exc:
         _discard(saved)
         raise ToolError(str(exc)) from exc
     except BaseException:
@@ -550,7 +589,8 @@ def _discard(file_ids: list[str]) -> None:
 @_server.tool(
     annotations=_WRITE,
     description=(
-        "Assess a story: runs the TypeSafe/Jev model and saves the report. "
+        "Assess a story: runs the TypeSafe/Jev model and saves the report. A human-only story can't be assessed by an "
+        "agent. "
         "story: story ID or key (e.g. 'FLW-12'). "
         "note: required — why you are assessing this story (e.g. 'Checking readiness before sprint planning')."
     ),
@@ -558,6 +598,7 @@ def _discard(file_ids: list[str]) -> None:
 async def assess_story(story: str, note: Note, ctx: Context) -> StoredStoryDetailOut:
     note = _require_note(note)
     s = _resolve_story(story)
+    _refuse_human_only(s)  # before paying for a Jev call
     if is_too_large(s.description, s.acceptance_criteria):
         raise ToolError("The story is longer than the size limit (10 000 chars per field).")
     request = AssessRequest(
@@ -572,6 +613,8 @@ async def assess_story(story: str, note: Note, ctx: Context) -> StoredStoryDetai
         raise ToolError(f"Assessment service unavailable: {exc.detail}") from exc
     try:
         story_store.add_assessment(s, report, actor=_actor(ctx, note))
+    except story_store.HumanOnlyError as exc:
+        raise ToolError(str(exc)) from exc
     except sqlite3.IntegrityError as exc:
         raise ToolError("Story was deleted during assessment.") from exc
     fresh = story_store.get_story(s.id)

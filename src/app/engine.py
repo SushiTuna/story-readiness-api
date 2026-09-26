@@ -138,11 +138,16 @@ async def assess(
     key: str | None = None,
     url: str | None = None,
     labels: list[str] | None = None,
+    *,
+    skip_agent_checks: bool = False,
 ) -> ReportOut:
     """Run the full assessment pipeline and return a :class:`ReportOut`.
 
     *labels* are tracker labels (e.g. Linear's ``Bug``), passed to Jev as a hint
     for classifying the story type. Paste requests have none.
+
+    *skip_agent_checks* is for human-only stories: no AI agent will implement them, so the
+    AI-agent readiness checks are neither asked nor scored, and can't cap the verdict.
     """
 
     # 1. Pre-process
@@ -242,6 +247,9 @@ async def assess(
             },
         ),
     }
+    if skip_agent_checks:
+        for check_id in AGENT_CHECK_IDS:
+            del questions[check_id]
     for i, item in enumerate(dor_items):
         questions[f"dor_{i}"] = ts.Noul(
             instructions={
@@ -265,7 +273,8 @@ async def assess(
     # 6. Filter checks to those applicable to the classified type
     applicable_checks = [
         c for c in CHECKS
-        if c.story_types is None or story_type_str in c.story_types
+        if (c.story_types is None or story_type_str in c.story_types)
+        and not (skip_agent_checks and c.id in AGENT_CHECK_IDS)
     ]
 
     # 7. Evaluate ac_present in code
@@ -411,4 +420,5 @@ async def assess(
         request_id=jev.request_id,
         latency_ms=jev.latency_ms,
         input_tokens=jev.input_tokens,
+        agent_checks_skipped=skip_agent_checks,
     )

@@ -417,7 +417,8 @@ paths:
       - stories
       summary: Store a pasted story on a board
       description: Adds the story to the end of the board's backlog. A board holds at most 100 stories, counting
-        every column.
+        every column. With parent_id it is split from another story on the board; a child of a human-only story
+        is human-only too. A parent_id not on the board is a 422 with loc ["body", "parent_id"] and type parent_invalid.
       operationId: createStory
       parameters:
       - name: board_id
@@ -430,7 +431,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/StoryIn'
+              $ref: '#/components/schemas/StoryCreateIn'
         required: true
       responses:
         '201':
@@ -681,6 +682,48 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/stories/{story_id}/human-only:
+    put:
+      tags:
+      - stories
+      summary: Set or clear a stored story's human-only tag
+      description: A human-only story depends on a person (accounts, servers, another team's API, or secrets).
+        AI agents using the MCP server can read it but not change it, and assessments skip the AI-agent readiness
+        checks. Only this API sets or clears the tag. Stories already split from it keep theirs. The latest
+        assessment turns stale. The change is logged as story_human_only; setting the value it already has is not.
+      operationId: setStoryHumanOnly
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HumanOnlyIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredStoryOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/stories/{story_id}/move:
     put:
       tags:
@@ -828,12 +871,13 @@ components:
           - story_moved
           - story_assessed
           - story_deleted
+          - story_human_only
           title: Action
         detail:
           type: object
           additionalProperties: true
           title: Detail
-          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}. A move into done has an "evidence" object with test_reports, ui_change, ui_evidence and commits; each uploaded file's id, filename, content_type and size are under "file".
+          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}. A move into done has an "evidence" object with test_reports, ui_change, ui_evidence and commits; each uploaded file's id, filename, content_type and size are under "file". A split story's story_created has "parent_key". story_human_only has {"human_only":true|false}, and "inherited_from" (the parent's key) when a split story inherited the tag.
         note:
           anyOf:
           - type: string
@@ -1208,6 +1252,17 @@ components:
           title: Detail
       type: object
       title: HTTPValidationError
+    HumanOnlyIn:
+      properties:
+        human_only:
+          type: boolean
+          title: Human Only
+          description: 'True: only people on the board may change the story; AI agents can''t, and assessments
+            skip the AI-agent readiness checks. Stories split from it keep their tag when it is cleared.'
+      type: object
+      required:
+      - human_only
+      title: HumanOnlyIn
     ImportRequest:
       properties:
         key:
@@ -1359,6 +1414,12 @@ components:
           - type: integer
           - type: 'null'
           title: Input Tokens
+        agent_checks_skipped:
+          type: boolean
+          title: Agent Checks Skipped
+          description: The story is human-only, so the AI-agent readiness checks were not run and are not in `checks`,
+            the quality score or the verdict.
+          default: false
       type: object
       required:
       - verdict
@@ -1467,6 +1528,22 @@ components:
           title: Agents
           description: Names of agents that have acted on this story, oldest first.
           default: []
+        human_only:
+          type: boolean
+          title: Human Only
+          description: Only people on the board may change the story; AI agents can't. Set with PUT …/human-only.
+        parent_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Id
+          description: ID of the story it was split from, or null.
+        parent_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Key
+          description: Key of the story it was split from, e.g. FLW-3, or null.
         report:
           anyOf:
           - $ref: '#/components/schemas/ReportOut'
@@ -1503,6 +1580,9 @@ components:
       - previous_quality
       - stale
       - agents
+      - human_only
+      - parent_id
+      - parent_key
       - report
       - history
       - activity
@@ -1584,6 +1664,22 @@ components:
           title: Agents
           description: Names of agents that have acted on this story, oldest first.
           default: []
+        human_only:
+          type: boolean
+          title: Human Only
+          description: Only people on the board may change the story; AI agents can't. Set with PUT …/human-only.
+        parent_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Id
+          description: ID of the story it was split from, or null.
+        parent_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Key
+          description: Key of the story it was split from, e.g. FLW-3, or null.
       type: object
       required:
       - id
@@ -1602,7 +1698,57 @@ components:
       - previous_quality
       - stale
       - agents
+      - human_only
+      - parent_id
+      - parent_key
       title: StoredStoryOut
+    StoryCreateIn:
+      properties:
+        title:
+          type: string
+          maxLength: 500
+          minLength: 1
+          title: Title
+          description: The story's title or summary.
+        description:
+          type: string
+          maxLength: 10000
+          title: Description
+          default: ''
+          description: The story body. If `acceptance_criteria` is empty, a section under an 'Acceptance criteria'
+            heading here is moved into it.
+        acceptance_criteria:
+          type: string
+          maxLength: 10000
+          title: Acceptance Criteria
+          default: ''
+          description: One criterion per bullet, or Given/When/Then scenarios.
+        definition_of_ready:
+          items:
+            type: string
+          type: array
+          maxItems: 50
+          title: Definition Of Ready
+          description: Extra requirements from the team's Definition of Ready, one per item. Each becomes
+            a yes/no check. Blank and duplicate items are dropped; at most 12 are used, each cut to 300 characters.
+        parent_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Id
+          description: ID of the story on the same board that this one is split from. A child of a human-only
+            story is human-only too.
+        human_only:
+          type: boolean
+          title: Human Only
+          description: Only people on the board may change the story; AI agents can't. It skips the AI-agent
+            readiness checks.
+          default: false
+      type: object
+      required:
+      - title
+      title: StoryCreateIn
+      description: A new story to store, optionally split from another story on the same board.
     StoryIn:
       properties:
         title:

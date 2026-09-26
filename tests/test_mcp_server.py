@@ -220,3 +220,81 @@ async def test_moving_to_done_needs_evidence_and_uploads_local_files(tmp_path):
         assert evidence["ui_evidence"][0]["file"]["content_type"] == "image/png"
         assert evidence["commits"] == [{"hash": "a53287d", "message": "Scaffold the monorepo"}]
         assert moved.note == "All ACs verified"
+
+
+# ---------------------------------------------------------------------------
+# Human-only stories: agents can read them but never change them
+# ---------------------------------------------------------------------------
+
+def _human_only_story() -> story_store.StoredStory:
+    """SHP-1 "Provision staging DB creds", tagged human-only by someone on the board."""
+    board = story_store.create_board(name="Shop", key_prefix="SHP")
+    return story_store.create_story(
+        board.id, title="Provision staging DB creds", description="", acceptance_criteria="", definition_of_ready=[],
+        human_only=True,
+    )
+
+
+async def test_every_agent_write_to_a_human_only_story_is_rejected(monkeypatch, tmp_path):
+    story = _human_only_story()
+
+    async def must_not_assess(*args, **kwargs):
+        raise AssertionError("a human-only story must not reach Jev")
+
+    monkeypatch.setattr("app.engine.assess", must_not_assess)
+    report = tmp_path / "report.txt"
+    report.write_text("3 passed")
+    evidence = {**_EVIDENCE, "test_reports": [{"kind": "unit", "path": str(report)}]}
+
+    async with Client(_server) as client:
+        attempts = [
+            ("update_story", {"story": "SHP-1", "title": "Use prod creds", "note": "Faster"}),
+            ("move_story", {"story": "SHP-1", "status": "refinement", "note": "Refine it"}),
+            ("move_story", {"story": "SHP-1", "status": "done", "done_evidence": evidence, "note": "Done"}),
+            ("assess_story", {"story": story.id, "note": "Check readiness"}),
+        ]
+        for tool, args in attempts:
+            error = await _error(client, tool, **args)
+            assert error == (
+                f"Error executing tool {tool}: SHP-1 is human-only: it depends on a person (accounts, servers, another "
+                "team's API, or secrets), so AI agents can't change it. Ask someone on the board to do it, or to clear "
+                "the tag."
+            )
+
+        detail = await _call(client, "get_story", story="SHP-1")
+
+    assert (detail["title"], detail["status"], detail["human_only"]) == ("Provision staging DB creds", "backlog", True)
+    assert detail["history"] == [] and detail["agents"] == []
+    assert {a["actor_kind"] for a in detail["activity"]} == {"user"}
+    assert not story_store._evidence_dir(story.id).exists()  # the report was never uploaded
+
+
+async def test_agents_can_read_human_only_stories_flagged():
+    _human_only_story()
+    async with Client(_server) as client:
+        [listed] = (await _call(client, "list_stories", board="SHP"))["result"]
+        detail = await _call(client, "get_story", story="SHP-1")
+    assert (listed["key"], listed["human_only"], listed["parent_key"]) == ("SHP-1", True, None)
+    assert detail["human_only"] is True
+
+
+async def test_agents_cannot_split_a_human_only_story_but_can_split_others():
+    _human_only_story()
+    async with Client(_server) as client:
+        error = await _error(client, "create_story", board="SHP", title="Rotate the key", parent="SHP-1", note="Split")
+        assert "SHP-1 is human-only" in error and "only people on the board can create them" in error
+
+        await _call(client, "create_story", board="SHP", title="Checkout", note="From the brief")
+        child = await _call(client, "create_story", board="SHP", title="Card payments", parent="SHP-2", note="Split")
+        assert (child["key"], child["parent_key"], child["human_only"]) == ("SHP-3", "SHP-2", False)
+
+        other = await _call(client, "create_board", name="Other", key_prefix="OTH", note="New goal")
+        error = await _error(client, "create_story", board=other["id"], title="X", parent="SHP-2", note="Split")
+        assert "not on board OTH" in error
+
+
+async def test_no_tool_can_set_or_clear_the_human_only_tag():
+    async with Client(_server) as client:
+        tools = (await client.list_tools()).tools
+    for tool in tools:
+        assert "human_only" not in tool.input_schema.get("properties", {}), tool.name
