@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Annotated, Literal
 
 from dotenv import load_dotenv
@@ -26,7 +27,7 @@ from mcp.server.mcpserver.tools.base import ToolAnnotations
 from app import engine, story_store
 from app.jev_client import JevError
 from app.routers.boards import _out as _board_out
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from app.routers.errors import is_too_large
 from app.routers.stories import _activity_out, _fields, _summary
@@ -36,6 +37,8 @@ from app.schemas import (
     BoardIn,
     BoardOut,
     BoardUpdateIn,
+    CommitIn,
+    DoneEvidenceIn,
     StoredStoryDetailOut,
     StoredStoryOut,
     StoryIn,
@@ -59,6 +62,10 @@ You are working with a Story Board backed by SQLite. Each board holds at most 10
 
 Rules:
 - A story in the "blocked" column MUST have a blocked_reason.
+- Moving a story INTO "done" MUST include done_evidence: at least one test report (unit, integration or
+  cucumber) as a local file path or a URL, ui_change (true if the story changes the UI; then at least one
+  screenshot or recording), and at least one commit (hash and message). The evidence is attached to the
+  story's activity log. Do not move a story to done without real evidence.
 - Stories have a human-readable key like FLW-12. You can use keys or IDs in all tools.
 - Boards are identified by ID or key prefix (e.g. "FLW").
 
@@ -389,6 +396,77 @@ def update_story(
     return _out(updated)
 
 
+class EvidenceItem(BaseModel):
+    path: str | None = Field(
+        None, description="Absolute path of a local file: a test report (.html .xml .json .txt .log .pdf) or a "
+        "screenshot or recording (.png .jpg .jpeg .gif .webp .mp4 .webm .mov), at most 50 MB."
+    )
+    url: str | None = Field(None, description="Link to evidence kept elsewhere, e.g. a CI run. Give path or url.")
+    caption: str | None = Field(None, description="Optional short summary, e.g. '42 passed'.")
+
+
+class TestReportItem(EvidenceItem):
+    __test__ = False  # not a pytest test class
+
+    kind: Literal["unit", "integration", "cucumber"]
+
+
+class DoneEvidence(BaseModel):
+    test_reports: list[TestReportItem] = Field(description="At least one test report.")
+    ui_change: bool = Field(description="True if the story changes the UI.")
+    ui_evidence: list[EvidenceItem] = Field(
+        default_factory=list, description="Screenshots or recordings; at least one when ui_change is true."
+    )
+    commits: list[CommitIn] = Field(description="At least one commit: hash (7–40 hex) and message.")
+
+
+def _evidence_in(evidence: DoneEvidence) -> DoneEvidenceIn:
+    """Validate the evidence's shape before any file is read; each path stands in as its file_id until uploaded."""
+
+    def item(entry: EvidenceItem) -> dict:
+        out = entry.model_dump(exclude={"path"})
+        out["file_id"] = entry.path
+        return out
+
+    try:
+        return DoneEvidenceIn(
+            test_reports=[item(r) for r in evidence.test_reports],
+            ui_change=evidence.ui_change,
+            ui_evidence=[item(e) for e in evidence.ui_evidence],
+            commits=evidence.commits,
+        )
+    except ValidationError as exc:
+        raise _invalid(exc) from exc
+
+
+def _read_evidence_file(path_str: str) -> tuple[str, bytes]:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        raise ToolError(f"Evidence path must be absolute: {path_str!r}.")
+    if not path.is_file():
+        raise ToolError(f"Evidence file not found: {path_str!r}.")
+    try:
+        story_store.evidence_content_type(path.name)
+    except story_store.EvidenceFileTypeError:
+        raise ToolError(f"Evidence file type not allowed: {path.name!r}. Use one of: {' '.join(story_store.EVIDENCE_TYPES)}.")
+    if path.stat().st_size > story_store.MAX_EVIDENCE_BYTES:
+        raise ToolError(f"Evidence file is larger than {story_store.MAX_EVIDENCE_BYTES // (1024 * 1024)} MB: {path_str!r}.")
+    return path.name, path.read_bytes()
+
+
+def _upload_paths(story_id: str, evidence: DoneEvidenceIn, saved: list[str]) -> None:
+    """Upload every path standing in as a file_id and swap in the real ID. Appends each new file's ID to *saved*."""
+    for entry in [*evidence.test_reports, *evidence.ui_evidence]:
+        if entry.file_id is None:
+            continue
+        name, data = _read_evidence_file(entry.file_id)
+        file = story_store.save_evidence_file(story_id, name, data)
+        if file is None:
+            raise ToolError("Story not found.")
+        saved.append(file.id)
+        entry.file_id = file.id
+
+
 @_server.tool(
     annotations=_WRITE,
     description=(
@@ -397,6 +475,8 @@ def update_story(
         "status: one of backlog/refinement/ready_for_sprint/in_sprint/done/blocked. "
         "place: 'top' (position = min - 1) or 'bottom' (position = max + 1, default). "
         "blocked_reason: required when moving to 'blocked'; not allowed otherwise. "
+        "done_evidence: required when moving INTO 'done'; not allowed otherwise. Test reports and "
+        "screenshots/recordings are absolute local file paths (uploaded for you) or URLs. "
         "note: required — why you are moving this story."
     ),
 )
@@ -407,34 +487,60 @@ def move_story(
     ctx: Context,
     place: Literal["top", "bottom"] = "bottom",
     blocked_reason: str | None = None,
+    done_evidence: DoneEvidence | None = None,
 ) -> StoredStoryOut:
     note = _require_note(note)
     s = _resolve_story(story)
-    # Validate via Pydantic so the Blocked rule fires.
+    evidence = _evidence_in(done_evidence) if done_evidence is not None else None
+    # Validate via Pydantic so the Blocked and Done rules fire.
     try:
         body = StoryMoveIn(
             status=status,
             position=0,  # placeholder; we compute the real one below
             blocked_reason=blocked_reason,
+            done_evidence=evidence,
         )
     except ValidationError as exc:
         raise _invalid(exc) from exc
+    if status == "done" and s.status != "done" and evidence is None:
+        raise ToolError(
+            "Moving a story to done needs done_evidence: at least one test report, a screenshot or recording if it "
+            "changes the UI, and at least one commit."
+        )
     # Same rule as positionBetween() in the board UI: one before the first card, or one after the last.
     bounds = story_store.column_bounds(s.board_id, body.status)
     if bounds is None:
         position = 1.0
     else:
         position = bounds[0] - 1 if place == "top" else bounds[1] + 1
-    updated = story_store.move_story(
-        s.id,
-        status=body.status,
-        position=position,
-        blocked_reason=body.blocked_reason,
-        actor=_actor(ctx, note),
-    )
+    saved: list[str] = []
+    try:
+        if evidence is not None:
+            _upload_paths(s.id, evidence, saved)
+        updated = story_store.move_story(
+            s.id,
+            status=body.status,
+            position=position,
+            blocked_reason=body.blocked_reason,
+            done_evidence=evidence.model_dump() if evidence is not None else None,
+            actor=_actor(ctx, note),
+        )
+    except story_store.EvidenceError as exc:
+        _discard(saved)
+        raise ToolError(str(exc)) from exc
+    except BaseException:
+        _discard(saved)
+        raise
     if updated is None:
+        _discard(saved)
         raise ToolError(f"Story not found: {story!r}.")
     return _out(updated)
+
+
+def _discard(file_ids: list[str]) -> None:
+    """Delete evidence files uploaded for a move that did not happen."""
+    for file_id in file_ids:
+        story_store.delete_unattached_evidence_file(file_id)
 
 
 @_server.tool(

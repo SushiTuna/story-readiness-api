@@ -9,18 +9,29 @@ from __future__ import annotations
 import logging
 import sqlite3
 
-from fastapi import APIRouter, Query, Response
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, File, Query, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app import engine, story_store
 from app.jev_client import JevError
-from app.routers.errors import board_full, board_not_found, jev_unavailable, too_large
+from app.routers.errors import (
+    board_full,
+    board_not_found,
+    evidence_attached,
+    evidence_invalid,
+    evidence_not_found,
+    evidence_too_large,
+    evidence_type_not_allowed,
+    jev_unavailable,
+    too_large,
+)
 from app.schemas import (
     ActivityOut,
     AssessmentSummaryOut,
     AssessRequest,
     ErrorOut,
+    EvidenceFileOut,
     ReportOut,
     StoredStoryDetailOut,
     StoredStoryOut,
@@ -37,6 +48,7 @@ _NOT_FOUND = {404: {"model": ErrorOut, "description": "The story was not found."
 _BOARD_NOT_FOUND = {404: {"model": ErrorOut, "description": "The board was not found."}}
 _BOARD_FULL = {409: {"model": ErrorOut, "description": "The board already holds the most stories it can."}}
 _TOO_LARGE = {413: {"model": ErrorOut, "description": "The story is longer than the size limit."}}
+_EVIDENCE_NOT_FOUND = {404: {"model": ErrorOut, "description": "The evidence file was not found."}}
 
 
 def _not_found() -> JSONResponse:
@@ -202,18 +214,107 @@ def update_story(story_id: str, body: StoryIn) -> StoredStoryOut | JSONResponse:
     summary="Move a stored story to a workflow column and position",
     description=(
         "Used by drag and drop on the board. Does not change the story's text or mark it stale. "
-        "Moving to the blocked column requires a blocked_reason; moving anywhere else clears it."
+        "Moving to the blocked column requires a blocked_reason; moving anywhere else clears it. "
+        "Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); "
+        "it is recorded in the story's activity."
     ),
     responses=_NOT_FOUND,
 )
 def move_story(story_id: str, body: StoryMoveIn) -> StoredStoryOut | JSONResponse:
-    story = story_store.move_story(
-        story_id, status=body.status, position=body.position, blocked_reason=body.blocked_reason
-    )
+    evidence = body.done_evidence.model_dump() if body.done_evidence is not None else None
+    try:
+        story = story_store.move_story(
+            story_id, status=body.status, position=body.position, blocked_reason=body.blocked_reason,
+            done_evidence=evidence,
+        )
+    except story_store.EvidenceError as exc:
+        return evidence_invalid(str(exc))
     if story is None:
         return _not_found()
     recent = story_store.list_assessments(story_id)[:2]
     return StoredStoryOut(**_fields(story, recent))
+
+
+@router.post(
+    "/stories/{story_id}/evidence",
+    response_model=EvidenceFileOut,
+    status_code=201,
+    operation_id="uploadEvidence",
+    summary="Upload an evidence file for a move to Done",
+    description=(
+        f"A test report ({', '.join(e for e, t in story_store.EVIDENCE_TYPES.items() if not t.startswith(('image/', 'video/')))}) "
+        f"or a screenshot or recording ({', '.join(e for e, t in story_store.EVIDENCE_TYPES.items() if t.startswith(('image/', 'video/')))}), "
+        f"at most {story_store.MAX_EVIDENCE_BYTES // (1024 * 1024)} MB. Pass the returned id in done_evidence when "
+        "moving the story to Done."
+    ),
+    responses={
+        **_NOT_FOUND,
+        413: {"model": ErrorOut, "description": "The evidence file is larger than the size limit."},
+        415: {"model": ErrorOut, "description": "The evidence file's type is not allowed."},
+    },
+)
+def upload_evidence(story_id: str, file: UploadFile = File(...)) -> EvidenceFileOut | JSONResponse:
+    try:
+        story_store.evidence_content_type(file.filename or "")
+    except story_store.EvidenceFileTypeError:
+        return evidence_type_not_allowed()
+    data = file.file.read(story_store.MAX_EVIDENCE_BYTES + 1)  # one byte over tells us it is too large
+    try:
+        saved = story_store.save_evidence_file(story_id, file.filename or "", data)
+    except story_store.EvidenceFileTooLargeError:
+        return evidence_too_large()
+    if saved is None:
+        return _not_found()
+    return EvidenceFileOut(
+        id=saved.id, filename=saved.filename, content_type=saved.content_type, size=saved.size,
+        created_at=saved.created_at,
+    )
+
+
+# Screenshots and recordings show inline in the activity log; anything else downloads, so an uploaded HTML
+# report can never run scripts on the board's origin.
+_INLINE_TYPES = ("image/", "video/")
+
+
+@router.get(
+    "/evidence/{file_id}",
+    response_class=FileResponse,
+    operation_id="getEvidence",
+    summary="Download an evidence file",
+    responses={200: {"description": "The file.", "content": {"application/octet-stream": {}}}, **_EVIDENCE_NOT_FOUND},
+)
+def get_evidence(file_id: str) -> Response:
+    file = story_store.get_evidence_file(file_id)
+    path = story_store.evidence_path(file) if file else None
+    if file is None or not path.is_file():
+        return evidence_not_found()
+    inline = file.content_type.startswith(_INLINE_TYPES)
+    return FileResponse(
+        path,
+        media_type=file.content_type,
+        filename=file.filename,
+        content_disposition_type="inline" if inline else "attachment",
+        headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"},
+    )
+
+
+@router.delete(
+    "/evidence/{file_id}",
+    status_code=204,
+    response_class=Response,
+    operation_id="deleteEvidence",
+    summary="Delete an evidence file that no move has used yet",
+    responses={
+        **_EVIDENCE_NOT_FOUND,
+        409: {"model": ErrorOut, "description": "The evidence file is part of a move to Done, so it is kept."},
+    },
+)
+def delete_evidence(file_id: str) -> Response:
+    try:
+        deleted = story_store.delete_unattached_evidence_file(file_id)
+    except story_store.EvidenceFileAttachedError:
+        return evidence_attached()
+    return Response(status_code=204) if deleted else evidence_not_found()
 
 
 @router.delete(

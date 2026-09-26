@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import uuid
 from collections.abc import Iterator
@@ -85,6 +86,16 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 CREATE INDEX IF NOT EXISTS activity_story ON activity(story_id, id);
 CREATE INDEX IF NOT EXISTS activity_board ON activity(board_id, id);
+CREATE TABLE IF NOT EXISTS evidence_files (
+    id           TEXT PRIMARY KEY,  -- also the file's name on disk, under evidence/<story_id>/
+    story_id     TEXT NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    filename     TEXT NOT NULL,     -- the uploaded name, shown and used for downloads
+    content_type TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    created_at   TEXT NOT NULL,
+    attached     INTEGER NOT NULL DEFAULT 0  -- 1 once a move to Done uses it; attached files can't be deleted
+);
+CREATE INDEX IF NOT EXISTS evidence_files_story ON evidence_files(story_id);
 """
 
 
@@ -98,6 +109,43 @@ class BoardFullError(Exception):
 
 class DuplicateKeyPrefixError(Exception):
     """Another board already uses this key prefix."""
+
+
+class EvidenceError(Exception):
+    """A move to Done is missing its evidence, or the evidence refers to files it can't use."""
+
+
+class EvidenceFileTypeError(Exception):
+    """The file's extension is not one of EVIDENCE_TYPES."""
+
+
+class EvidenceFileTooLargeError(Exception):
+    """The file is larger than MAX_EVIDENCE_BYTES."""
+
+
+class EvidenceFileAttachedError(Exception):
+    """The file is part of a move to Done, so it is kept."""
+
+
+# Evidence files: test reports, and screenshots or recordings of UI changes. The content type comes from the
+# extension, never from the client, so a file is always served as what its name says.
+EVIDENCE_TYPES = {
+    ".html": "text/html",
+    ".xml": "application/xml",
+    ".json": "application/json",
+    ".txt": "text/plain",
+    ".log": "text/plain",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+}
+MAX_EVIDENCE_BYTES = 50 * 1024 * 1024
 
 
 @dataclass
@@ -157,6 +205,17 @@ class Assessment:
 
     def report(self) -> ReportOut | None:
         return ReportOut.model_validate_json(self.report_json) if self.report_json else None
+
+
+@dataclass
+class EvidenceFile:
+    id: str
+    story_id: str
+    filename: str
+    content_type: str
+    size: int
+    created_at: datetime
+    attached: bool = False
 
 
 @dataclass
@@ -257,6 +316,18 @@ def _activity(row: sqlite3.Row) -> ActivityEntry:
         detail=json.loads(row["detail"]),
         note=row["note"],
         created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _evidence_file(row: sqlite3.Row) -> EvidenceFile:
+    return EvidenceFile(
+        id=row["id"],
+        story_id=row["story_id"],
+        filename=row["filename"],
+        content_type=row["content_type"],
+        size=row["size"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        attached=bool(row["attached"]),
     )
 
 
@@ -443,7 +514,10 @@ def delete_board(board_id: str) -> bool:
     Returns False if the board did not exist.
     """
     with _connect() as conn:
+        story_ids = [r["id"] for r in conn.execute("SELECT id FROM stories WHERE board_id = ?", (board_id,))]
         cur = conn.execute("DELETE FROM boards WHERE id = ?", (board_id,))
+    for story_id in story_ids:
+        _remove_evidence_dir(story_id)
     return cur.rowcount > 0
 
 
@@ -666,11 +740,16 @@ def move_story(
     status: str,
     position: float,
     blocked_reason: str | None = None,
+    done_evidence: dict | None = None,
     actor: Actor = BOARD_USER,
 ) -> StoredStory | None:
     """Put a story in a workflow column at *position*. Does not touch updated_at: moving is not an edit.
 
     *blocked_reason* is kept only for the blocked column; any other column clears it.
+
+    Entering the done column needs *done_evidence* (DoneEvidenceIn as a dict); moving within it does not, and no
+    other move takes it. Its uploaded files must belong to the story and not be used yet. They are marked attached,
+    and the evidence, with each file's name, type and size, goes into the activity entry. Raises EvidenceError.
     """
     if status not in STATUSES:
         raise ValueError(f"Unknown status: {status}")
@@ -683,6 +762,15 @@ def move_story(
         old_status = old_row["status"]
         board_id = old_row["board_id"]
         story_key = f"{old_row['key_prefix']}-{old_row['number']}"
+        entering_done = status == "done" and old_status != "done"
+        if entering_done and done_evidence is None:
+            raise EvidenceError(
+                "Moving a story to Done needs done_evidence: at least one test report, a screenshot or recording "
+                "if it changes the UI, and at least one commit."
+            )
+        if done_evidence is not None and not entering_done:
+            raise EvidenceError("done_evidence is only accepted when a story enters Done.")
+        evidence = _attach_evidence(conn, story_id, done_evidence) if done_evidence is not None else None
         cur = conn.execute(
             "UPDATE stories SET status = ?, position = ?, blocked_reason = ? WHERE id = ?",
             (status, position, reason, story_id),
@@ -693,6 +781,8 @@ def move_story(
         detail: dict = {"from": old_status, "to": status}
         if reason:
             detail["blocked_reason"] = reason
+        if evidence is not None:
+            detail["evidence"] = evidence
         _log_activity(
             conn,
             board_id=board_id,
@@ -726,6 +816,7 @@ def delete_story(story_id: str, actor: Actor = BOARD_USER) -> bool:
             action="story_deleted",
             detail={"key": story_key},
         )
+    _remove_evidence_dir(story_id)
     return True
 
 
@@ -797,3 +888,112 @@ def list_activity(board_id: str, story_id: str | None = None, limit: int = 100) 
                 (board_id, limit),
             ).fetchall()
     return [_activity(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Evidence files
+# ---------------------------------------------------------------------------
+
+
+def _evidence_dir(story_id: str) -> Path:
+    """Evidence files live next to the database, one directory per story."""
+    return _db_path().parent / "evidence" / story_id
+
+
+def _remove_evidence_dir(story_id: str) -> None:
+    shutil.rmtree(_evidence_dir(story_id), ignore_errors=True)
+
+
+def evidence_path(file: EvidenceFile) -> Path:
+    return _evidence_dir(file.story_id) / file.id
+
+
+def evidence_content_type(filename: str) -> str:
+    """The content type for *filename*'s extension. Raises EvidenceFileTypeError for any other extension."""
+    content_type = EVIDENCE_TYPES.get(Path(filename).suffix.lower())
+    if content_type is None:
+        raise EvidenceFileTypeError(filename)
+    return content_type
+
+
+def save_evidence_file(story_id: str, filename: str, data: bytes) -> EvidenceFile | None:
+    """Store an uploaded evidence file for a story; a move to Done can then use it by ID.
+
+    Returns None if the story does not exist. Raises EvidenceFileTypeError and EvidenceFileTooLargeError.
+    """
+    name = Path(filename.replace("\\", "/")).name.strip()[:200] or "evidence"
+    content_type = evidence_content_type(name)
+    if len(data) > MAX_EVIDENCE_BYTES:
+        raise EvidenceFileTooLargeError(filename)
+    file = EvidenceFile(
+        id=str(uuid.uuid4()), story_id=story_id, filename=name, content_type=content_type, size=len(data),
+        created_at=_now(),
+    )
+    with _connect() as conn:
+        if conn.execute("SELECT 1 FROM stories WHERE id = ?", (story_id,)).fetchone() is None:
+            return None
+        conn.execute(
+            """
+            INSERT INTO evidence_files (id, story_id, filename, content_type, size, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (file.id, file.story_id, file.filename, file.content_type, file.size, file.created_at.isoformat()),
+        )
+        # Written inside the transaction: if the write fails, the row is rolled back with it.
+        path = evidence_path(file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return file
+
+
+def get_evidence_file(file_id: str) -> EvidenceFile | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM evidence_files WHERE id = ?", (file_id,)).fetchone()
+    return _evidence_file(row) if row else None
+
+
+def delete_unattached_evidence_file(file_id: str) -> bool:
+    """Delete an evidence file no move has used yet. Returns False if it does not exist.
+
+    Raises EvidenceFileAttachedError if a move to Done uses it.
+    """
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM evidence_files WHERE id = ?", (file_id,)).fetchone()
+        if row is None:
+            return False
+        file = _evidence_file(row)
+        if file.attached:
+            raise EvidenceFileAttachedError(file_id)
+        conn.execute("DELETE FROM evidence_files WHERE id = ?", (file_id,))
+    evidence_path(file).unlink(missing_ok=True)
+    return True
+
+
+def _attach_evidence(conn: sqlite3.Connection, story_id: str, evidence: dict) -> dict:
+    """Mark the evidence's files attached and return the evidence for the activity log, with file details.
+
+    Runs in move_story's transaction, so a refused move leaves every file unattached.
+    """
+    seen: set[str] = set()
+
+    def item(entry: dict) -> dict:
+        out = {k: entry[k] for k in ("kind", "caption", "url") if entry.get(k) is not None}
+        file_id = entry.get("file_id")
+        if file_id is None:
+            return out
+        row = conn.execute("SELECT * FROM evidence_files WHERE id = ?", (file_id,)).fetchone()
+        if row is None or row["story_id"] != story_id:
+            raise EvidenceError(f"Evidence file {file_id} was not uploaded for this story.")
+        if row["attached"] or file_id in seen:
+            raise EvidenceError(f"Evidence file {file_id} is already used.")
+        seen.add(file_id)
+        conn.execute("UPDATE evidence_files SET attached = 1 WHERE id = ?", (file_id,))
+        out["file"] = {k: row[k] for k in ("id", "filename", "content_type", "size")}
+        return out
+
+    return {
+        "test_reports": [item(r) for r in evidence["test_reports"]],
+        "ui_change": evidence["ui_change"],
+        "ui_evidence": [item(e) for e in evidence.get("ui_evidence", [])],
+        "commits": [{"hash": c["hash"], "message": c["message"]} for c in evidence["commits"]],
+    }

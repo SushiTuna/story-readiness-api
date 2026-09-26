@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app.linear_client import LinearError
 from app.schemas import ErrorOut
-from app.story_store import MAX_STORIES_PER_BOARD
+from app.story_store import EVIDENCE_TYPES, MAX_EVIDENCE_BYTES, MAX_STORIES_PER_BOARD
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,29 @@ def board_not_found() -> JSONResponse:
 
 def board_full() -> JSONResponse:
     return _error(409, f"The board already has {MAX_STORIES_PER_BOARD} stories. Delete one to make room.")
+
+
+def evidence_invalid(message: str) -> JSONResponse:
+    """422 in the same shape as a request validation error, so clients handle it like a missing blocked_reason."""
+    error = {"loc": ["body", "done_evidence"], "msg": message, "type": "done_evidence_invalid"}
+    return JSONResponse(status_code=422, content={"detail": [error]})
+
+
+def evidence_not_found() -> JSONResponse:
+    return _error(404, "The evidence file was not found.")
+
+
+def evidence_too_large() -> JSONResponse:
+    return _error(413, f"The evidence file is larger than {MAX_EVIDENCE_BYTES // (1024 * 1024)} MB.")
+
+
+def evidence_type_not_allowed() -> JSONResponse:
+    types = " ".join(sorted(EVIDENCE_TYPES))
+    return _error(415, f"The evidence file must be one of these types: {types}.")
+
+
+def evidence_attached() -> JSONResponse:
+    return _error(409, "The evidence file is part of a move to Done, so it is kept.")
 
 
 _TRUE = {"1", "true", "yes", "on"}

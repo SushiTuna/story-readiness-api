@@ -566,12 +566,127 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/stories/{story_id}/evidence:
+    post:
+      tags:
+      - stories
+      summary: Upload an evidence file for a move to Done
+      description: A test report (.html, .xml, .json, .txt, .log, .pdf) or a screenshot or recording (.png, .jpg, .jpeg, .gif, .webp, .mp4, .webm, .mov), at most 50 MB. Pass the returned id in done_evidence when moving the story to Done. The content type comes from the file's extension.
+      operationId: uploadEvidence
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_uploadEvidence'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceFileOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '413':
+          description: The evidence file is larger than the size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '415':
+          description: The evidence file's type is not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/evidence/{file_id}:
+    get:
+      tags:
+      - stories
+      summary: Download an evidence file
+      description: Screenshots and recordings are served inline; every other type is served as an attachment. Every response has X-Content-Type-Options nosniff and Content-Security-Policy sandbox.
+      operationId: getEvidence
+      parameters:
+      - name: file_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: File Id
+      responses:
+        '200':
+          description: The file.
+          content:
+            application/octet-stream: {}
+        '404':
+          description: The evidence file was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - stories
+      summary: Delete an evidence file that no move has used yet
+      operationId: deleteEvidence
+      parameters:
+      - name: file_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: File Id
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: The evidence file was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '409':
+          description: The evidence file is part of a move to Done, so it is kept.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/stories/{story_id}/move:
     put:
       tags:
       - stories
       summary: Move a stored story to a workflow column and position
-      description: Used by drag and drop on the board. Does not change the story's text or mark it stale. Moving to the blocked column requires a blocked_reason; moving anywhere else clears it.
+      description: Used by drag and drop on the board. Does not change the story's text or mark it stale. Moving to the blocked column requires a blocked_reason; moving anywhere else clears it. Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); it is recorded in the story's activity. Missing or unusable evidence is a 422 with loc ["body", "done_evidence"].
       operationId: moveStory
       parameters:
       - name: story_id
@@ -718,7 +833,7 @@ components:
           type: object
           additionalProperties: true
           title: Detail
-          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}.
+          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}. A move into done has an "evidence" object with test_reports, ui_change, ui_evidence and commits; each uploaded file's id, filename, content_type and size are under "file".
         note:
           anyOf:
           - type: string
@@ -818,6 +933,16 @@ components:
       - question_count
       - created_at
       title: AssessmentSummaryOut
+    Body_uploadEvidence:
+      properties:
+        file:
+          type: string
+          format: binary
+          title: File
+      type: object
+      required:
+      - file
+      title: Body_uploadEvidence
     BoardIn:
       properties:
         name:
@@ -959,6 +1084,59 @@ components:
       - answer
       - ask
       title: CheckOut
+    CommitIn:
+      properties:
+        hash:
+          type: string
+          pattern: ^[0-9a-fA-F]{7,40}$
+          title: Hash
+          description: Commit hash, 7–40 hex characters. Stored in lowercase.
+          example: a53287d
+        message:
+          type: string
+          maxLength: 500
+          minLength: 1
+          title: Message
+          description: The commit's description.
+      type: object
+      required:
+      - hash
+      - message
+      title: CommitIn
+    DoneEvidenceIn:
+      properties:
+        test_reports:
+          items:
+            $ref: '#/components/schemas/TestReportIn'
+          type: array
+          maxItems: 10
+          minItems: 1
+          title: Test Reports
+        ui_change:
+          type: boolean
+          title: Ui Change
+          description: The story changes the UI; then ui_evidence needs a screenshot or recording.
+        ui_evidence:
+          items:
+            $ref: '#/components/schemas/EvidenceItemIn'
+          type: array
+          maxItems: 10
+          title: Ui Evidence
+          description: Screenshots or recordings. At least one when ui_change is true.
+        commits:
+          items:
+            $ref: '#/components/schemas/CommitIn'
+          type: array
+          maxItems: 20
+          minItems: 1
+          title: Commits
+      type: object
+      required:
+      - test_reports
+      - ui_change
+      - commits
+      title: DoneEvidenceIn
+      description: 'What moving a story into Done requires: test reports, UI evidence for UI changes, and the commits.'
     ErrorOut:
       properties:
         detail:
@@ -968,6 +1146,59 @@ components:
       required:
       - detail
       title: ErrorOut
+    EvidenceFileOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        filename:
+          type: string
+          title: Filename
+        content_type:
+          type: string
+          title: Content Type
+        size:
+          type: integer
+          title: Size
+          description: Size in bytes.
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - id
+      - filename
+      - content_type
+      - size
+      - created_at
+      title: EvidenceFileOut
+    EvidenceItemIn:
+      properties:
+        file_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: File Id
+          description: ID of an evidence file uploaded for this story and not used yet.
+        url:
+          anyOf:
+          - type: string
+            maxLength: 2000
+            pattern: ^https?://\S+$
+          - type: 'null'
+          title: Url
+          description: Link to evidence kept elsewhere, e.g. a CI run.
+        caption:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Caption
+          description: Optional short summary, e.g. '42 passed'.
+      type: object
+      title: EvidenceItemIn
+      description: 'One piece of evidence: a file uploaded with POST /stories/{story_id}/evidence, or a link. Give exactly one of file_id or url.'
     HTTPValidationError:
       properties:
         detail:
@@ -1430,6 +1661,11 @@ components:
           - type: 'null'
           title: Blocked Reason
           description: Why the story is blocked. Required when status is blocked; not allowed otherwise.
+        done_evidence:
+          anyOf:
+          - $ref: '#/components/schemas/DoneEvidenceIn'
+          - type: 'null'
+          description: Evidence that the story is done. Required when the story enters the done column; not allowed for other columns.
       type: object
       required:
       - status
@@ -1502,6 +1738,42 @@ components:
       - confidence
       - probabilities
       title: StoryType
+    TestReportIn:
+      properties:
+        file_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: File Id
+          description: ID of an evidence file uploaded for this story and not used yet.
+        url:
+          anyOf:
+          - type: string
+            maxLength: 2000
+            pattern: ^https?://\S+$
+          - type: 'null'
+          title: Url
+          description: Link to evidence kept elsewhere, e.g. a CI run.
+        caption:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Caption
+          description: Optional short summary, e.g. '42 passed'.
+        kind:
+          type: string
+          enum:
+          - unit
+          - integration
+          - cucumber
+          title: Kind
+          description: Which tests the report covers.
+      type: object
+      required:
+      - kind
+      title: TestReportIn
+      description: A test report. Give exactly one of file_id or url.
     ValidationError:
       properties:
         loc:

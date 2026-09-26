@@ -31,6 +31,13 @@ async def _error(client, tool: str, **args) -> str:
     return result.content[0].text
 
 
+_EVIDENCE = {
+    "test_reports": [{"kind": "unit", "url": "https://ci.example.com/runs/1"}],
+    "ui_change": False,
+    "commits": [{"hash": "a53287d", "message": "Scaffold the monorepo"}],
+}
+
+
 def _mock_assess(monkeypatch, quality: float) -> None:
     async def fake(body, *, source):
         report = _make_report()
@@ -98,7 +105,7 @@ async def test_move_to_top_or_bottom_of_a_column():
             await _call(client, "create_story", board="SHP", title=title, note="Add")
         top = await _call(client, "move_story", story="SHP-3", status="backlog", place="top", note="Most urgent")
         assert top["position"] == 0
-        first = await _call(client, "move_story", story="SHP-1", status="done", note="Shipped")
+        first = await _call(client, "move_story", story="SHP-1", status="done", done_evidence=_EVIDENCE, note="Shipped")
         assert first["position"] == 1
 
 
@@ -144,3 +151,54 @@ async def test_activity_of_a_story_on_another_board_is_an_error():
         await _call(client, "create_board", name="Ops", key_prefix="OPS", note="Start")
         await _call(client, "create_story", board="SHP", title="A", note="Add")
         assert "not on board OPS" in await _error(client, "get_activity", board="OPS", story="SHP-1")
+
+
+async def test_moving_to_done_needs_evidence_and_uploads_local_files(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text("<testsuite tests='3'/>")
+    shot = tmp_path / "home.png"
+    shot.write_bytes(b"png")
+    async with Client(_server) as client:
+        await _call(client, "create_board", name="Shop", key_prefix="SHP", note="Start")
+        await _call(client, "create_story", board="SHP", title="A", note="Add")
+
+        assert "needs done_evidence" in await _error(client, "move_story", story="SHP-1", status="done", note="Done")
+        assert "at least one screenshot" in await _error(
+            client, "move_story", story="SHP-1", status="done", note="Done", done_evidence={**_EVIDENCE, "ui_change": True}
+        )
+        assert "only allowed when status is done" in await _error(
+            client, "move_story", story="SHP-1", status="in_sprint", note="Go", done_evidence=_EVIDENCE
+        )
+        assert "must be absolute" in await _error(
+            client, "move_story", story="SHP-1", status="done", note="Done",
+            done_evidence={**_EVIDENCE, "test_reports": [{"kind": "unit", "path": "junit.xml"}]},
+        )
+        # The second file is missing: the first, already uploaded, is deleted again.
+        assert "not found" in await _error(
+            client, "move_story", story="SHP-1", status="done", note="Done",
+            done_evidence={
+                **_EVIDENCE,
+                "test_reports": [{"kind": "unit", "path": str(report)}, {"kind": "cucumber", "path": str(tmp_path / "x.json")}],
+            },
+        )
+        story = story_store.get_story_by_key("SHP-1")
+        assert story.status == "backlog"
+        evidence_dir = story_store._evidence_dir(story.id)
+        assert not evidence_dir.exists() or not any(evidence_dir.iterdir())
+
+        done = await _call(
+            client, "move_story", story="SHP-1", status="done", note="All ACs verified",
+            done_evidence={
+                "test_reports": [{"kind": "unit", "path": str(report), "caption": "3 passed"}],
+                "ui_change": True,
+                "ui_evidence": [{"path": str(shot)}],
+                "commits": [{"hash": "A53287D", "message": "Scaffold the monorepo"}],
+            },
+        )
+        assert done["status"] == "done"
+        [moved] = [e for e in story_store.list_activity(story.board_id, story_id=story.id) if e.action == "story_moved"]
+        evidence = moved.detail["evidence"]
+        assert evidence["test_reports"][0]["file"]["filename"] == "junit.xml"
+        assert evidence["ui_evidence"][0]["file"]["content_type"] == "image/png"
+        assert evidence["commits"] == [{"hash": "a53287d", "message": "Scaffold the monorepo"}]
+        assert moved.note == "All ACs verified"

@@ -67,6 +67,8 @@ def main() -> int:
             move = {"status": entry["status"], "position": position}
             if "blocked_reason" in entry:
                 move["blocked_reason"] = entry["blocked_reason"]
+            if "done_evidence" in entry:
+                move["done_evidence"] = entry["done_evidence"]
             client.put(f"/api/stories/{story['id']}/move", json=move).raise_for_status()
 
             result = "not assessed"

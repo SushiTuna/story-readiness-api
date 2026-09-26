@@ -217,6 +217,114 @@ async def test_move_blocked_reason_rules_are_422(client, body):
 
 
 # ---------------------------------------------------------------------------
+# Evidence for Done
+# ---------------------------------------------------------------------------
+
+_LINK_REPORT = {"kind": "integration", "url": "https://ci.example.com/runs/7"}
+_COMMIT = {"hash": "A53287D", "message": "Scaffold the monorepo"}
+
+
+def _evidence(**overrides) -> dict:
+    return {"test_reports": [_LINK_REPORT], "ui_change": False, "commits": [_COMMIT], **overrides}
+
+
+async def _upload(client, story_id: str, name: str, data: bytes):
+    return await client.post(f"/api/stories/{story_id}/evidence", files={"file": (name, data, "application/octet-stream")})
+
+
+async def test_upload_move_to_done_and_download_evidence(client):
+    story = await _create(client)
+    resp = await _upload(client, story["id"], "report.html", b"<script>alert(1)</script>")
+    assert resp.status_code == 201
+    report = resp.json()
+    assert (report["filename"], report["content_type"], report["size"]) == ("report.html", "text/html", 25)
+    shot = (await _upload(client, story["id"], "home.png", b"\x89PNG")).json()
+
+    move = f"/api/stories/{story['id']}/move"
+    missing = await client.put(move, json={"status": "done", "position": 1})
+    assert missing.status_code == 422
+    assert missing.json()["detail"][0]["loc"] == ["body", "done_evidence"]
+
+    body = _evidence(
+        test_reports=[{"kind": "unit", "file_id": report["id"], "caption": "3 passed"}, _LINK_REPORT],
+        ui_change=True,
+        ui_evidence=[{"file_id": shot["id"]}],
+    )
+    resp = await client.put(move, json={"status": "done", "position": 1, "done_evidence": body})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "done"
+
+    [moved, _created] = (await client.get(f"/api/stories/{story['id']}")).json()["activity"]
+    evidence = moved["detail"]["evidence"]
+    assert [r["kind"] for r in evidence["test_reports"]] == ["unit", "integration"]
+    assert evidence["test_reports"][0]["file"]["filename"] == "report.html"
+    assert evidence["test_reports"][1] == _LINK_REPORT
+    assert evidence["commits"] == [{"hash": "a53287d", "message": "Scaffold the monorepo"}]
+
+    # An HTML report downloads and is sandboxed; a screenshot shows inline.
+    html = await client.get(f"/api/evidence/{report['id']}")
+    assert html.content == b"<script>alert(1)</script>"
+    assert html.headers["content-disposition"].startswith("attachment")
+    assert html.headers["content-security-policy"] == "sandbox"
+    assert html.headers["x-content-type-options"] == "nosniff"
+    png = await client.get(f"/api/evidence/{shot['id']}")
+    assert (png.headers["content-type"], png.headers["content-disposition"].split(";")[0]) == ("image/png", "inline")
+
+    # Attached evidence is kept.
+    assert (await client.delete(f"/api/evidence/{report['id']}")).status_code == 409
+
+
+async def test_unused_evidence_can_be_deleted(client):
+    story = await _create(client)
+    file = (await _upload(client, story["id"], "log.txt", b"ok")).json()
+    assert (await client.delete(f"/api/evidence/{file['id']}")).status_code == 204
+    assert (await client.get(f"/api/evidence/{file['id']}")).status_code == 404
+    assert (await client.delete(f"/api/evidence/{file['id']}")).status_code == 404
+
+
+async def test_upload_rules(client, monkeypatch):
+    story = await _create(client)
+    assert (await _upload(client, story["id"], "run.sh", b"echo")).status_code == 415
+    assert (await _upload(client, "nope", "log.txt", b"ok")).status_code == 404
+    monkeypatch.setattr(story_store, "MAX_EVIDENCE_BYTES", 4)
+    assert (await _upload(client, story["id"], "log.txt", b"12345")).status_code == 413
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        _evidence(test_reports=[]),
+        _evidence(commits=[]),
+        _evidence(ui_change=True),
+        _evidence(test_reports=[{"kind": "unit"}]),
+        _evidence(test_reports=[{"kind": "unit", "file_id": "x", "url": "https://ci.example.com"}]),
+        _evidence(test_reports=[{"kind": "smoke", "url": "https://ci.example.com"}]),
+        _evidence(test_reports=[{"kind": "unit", "url": "javascript:alert(1)"}]),
+        _evidence(commits=[{"hash": "xyz1234", "message": "Nope"}]),
+        _evidence(commits=[{"hash": "abc12", "message": "Too short"}]),
+        _evidence(commits=[{"hash": "abc1234", "message": ""}]),
+        _evidence(test_reports=[{"kind": "unit", "file_id": "not-uploaded"}]),
+    ],
+)
+async def test_move_to_done_evidence_rules_are_422(client, evidence):
+    story = await _create(client)
+    resp = await client.put(f"/api/stories/{story['id']}/move", json={"status": "done", "position": 1, "done_evidence": evidence})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]
+    assert story_store.get_story(story["id"]).status == "backlog"
+
+
+async def test_evidence_is_only_for_entering_done(client):
+    story = await _create(client)
+    move = f"/api/stories/{story['id']}/move"
+    resp = await client.put(move, json={"status": "in_sprint", "position": 1, "done_evidence": _evidence()})
+    assert resp.status_code == 422
+    assert (await client.put(move, json={"status": "done", "position": 1, "done_evidence": _evidence()})).status_code == 200
+    # Reordering within Done needs no new evidence.
+    assert (await client.put(move, json={"status": "done", "position": 0.5})).status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Activity log
 # ---------------------------------------------------------------------------
 

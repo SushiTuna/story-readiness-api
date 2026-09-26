@@ -1,8 +1,9 @@
 {
-  "_comment": "Fictional backlog of a Scrum team building a B2B spare-parts ordering portal: Java 21 / Spring Boot backend (order-service) and React + TypeScript frontend (web). File paths, services and people are made up. Loaded by scripts/seed_example_stories.py; 'status' is the board column ('blocked' stories also need 'blocked_reason'), 'assess' runs a real Jev assessment, 'edit_after_assess' changes the story afterwards so it shows as edited since assessed.",
+  "_comment": "Fictional backlog of a Scrum team building a B2B spare-parts ordering portal: Java 21 / Spring Boot backend (order-service) and React + TypeScript frontend (web). File paths, services and people are made up. Loaded by scripts/seed_example_stories.py; 'status' is the board column ('blocked' stories also need 'blocked_reason', 'done' stories 'done_evidence' with links and commits), 'assess' runs a real Jev assessment, 'edit_after_assess' changes the story afterwards so it shows as edited since assessed.",
   "stories": [
     {
       "status": "done",
+      "done_evidence": {"test_reports": [{"kind": "unit", "url": "https://ci.example.com/order-service/builds/412", "caption": "OidcAuthFilterTest 9 passed"}, {"kind": "integration", "url": "https://ci.example.com/order-service/builds/412/it", "caption": "SsoLoginIT 4 passed"}], "ui_change": false, "commits": [{"hash": "3f9c2e1", "message": "feat(auth): validate company SSO tokens on the order API"}]},
       "assess": true,
       "title": "Sign in to the portal with the company SSO",
       "description": "As a buyer at a customer company I want to sign in with my company's single sign-on account so that I don't need a separate portal password.\n\nBackend: configure Spring Security as an OAuth2 resource server in order-service (order-service/src/main/java/com/example/orders/config/SecurityConfig.java) that validates JWTs from our OpenID Connect provider. The issuer URL is already in application.yml as `portal.oidc.issuer`. Map the `customer_id` claim to the authenticated principal, like the existing `ApiKeyAuthenticationFilter` does for API keys.\n\nFrontend: use the existing `AuthProvider` in web/src/auth/AuthProvider.tsx with oidc-client-ts; the login page is web/src/pages/LoginPage.tsx.\n\nRollout: behind the feature flag `sso-login` (existing flag service); password login stays available until the flag is removed.",
@@ -10,6 +11,7 @@
     },
     {
       "status": "done",
+      "done_evidence": {"test_reports": [{"kind": "unit", "url": "https://ci.example.com/web/builds/977", "caption": "StatusBadge.test.tsx 6 passed"}], "ui_change": true, "ui_evidence": [{"url": "https://ci.example.com/web/builds/977/artifacts/order-list-badges.png", "caption": "Order list with all five badges"}], "commits": [{"hash": "b71d0a4", "message": "feat(web): status badges in the order list"}]},
       "assess": true,
       "title": "Show order status badges in the order list",
       "description": "As a buyer I want to see each order's status at a glance in my order list so that I know which orders still need attention without opening them.\n\nAdd a `StatusBadge` component in web/src/features/orders/StatusBadge.tsx and use it in the Status column of web/src/features/orders/OrderList.tsx. The API already returns `status` (one of PENDING, CONFIRMED, SHIPPED, DELIVERED, CANCELLED) from GET /api/orders; no backend change.\n\nLabels and colours follow the design tokens in web/src/theme/tokens.css: PENDING grey, CONFIRMED blue, SHIPPED indigo, DELIVERED green, CANCELLED red, each with the status as text so it does not rely on colour alone.",

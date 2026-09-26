@@ -28,6 +28,21 @@ def _st_board() -> story_store.Board:
     return next(b for b in story_store.list_boards() if b.key_prefix == "ST")
 
 
+def _evidence(*files: str, ui_change: bool = False) -> dict:
+    """Evidence for a move to Done, as DoneEvidenceIn dumps it: a unit report (the first file, or a link), the rest as UI
+    evidence, and one commit."""
+    reports = [{"kind": "unit", "file_id": files[0], "url": None, "caption": "3 passed"}] if files else [
+        {"kind": "unit", "file_id": None, "url": "https://ci.example.com/runs/1", "caption": None}
+    ]
+    ui = [{"file_id": f, "url": None, "caption": None} for f in files[1:]]
+    return {
+        "test_reports": reports,
+        "ui_change": ui_change,
+        "ui_evidence": ui,
+        "commits": [{"hash": "a53287d", "message": "Scaffold the monorepo"}],
+    }
+
+
 def _create(board_id: str | None = None, **fields) -> story_store.StoredStory:
     return story_store.create_story(board_id or _st_board().id, **{**_STORY, **fields})
 
@@ -322,7 +337,7 @@ def test_board_holds_at_most_max_stories_counting_every_column(monkeypatch):
     monkeypatch.setattr(story_store, "MAX_STORIES_PER_BOARD", 3)
     board = _st_board()
     first = _create()
-    story_store.move_story(first.id, status="done", position=1)
+    story_store.move_story(first.id, status="done", position=1, done_evidence=_evidence())
     _create()
     _create()
     with pytest.raises(story_store.BoardFullError):
@@ -468,3 +483,97 @@ def test_column_bounds():
     assert story_store.column_bounds(board.id, "backlog") is None
     _create(), _create()
     assert story_store.column_bounds(board.id, "backlog") == (1, 2)
+
+
+def test_entering_done_needs_evidence_and_logs_it():
+    story = _create()
+    with pytest.raises(story_store.EvidenceError, match="needs done_evidence"):
+        story_store.move_story(story.id, status="done", position=1)
+    assert story_store.get_story(story.id).status == "backlog"
+
+    report = story_store.save_evidence_file(story.id, "junit.xml", b"<testsuite tests='3'/>")
+    shot = story_store.save_evidence_file(story.id, "C:\\shots\\home.png", b"png")
+    assert (report.content_type, report.size, shot.filename) == ("application/xml", 22, "home.png")
+    story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence(report.id, shot.id, ui_change=True))
+
+    [moved] = [e for e in _log(story.id) if e.action == "story_moved"]
+    assert moved.detail == {
+        "from": "backlog",
+        "to": "done",
+        "evidence": {
+            "test_reports": [{
+                "kind": "unit", "caption": "3 passed",
+                "file": {"id": report.id, "filename": "junit.xml", "content_type": "application/xml", "size": 22},
+            }],
+            "ui_change": True,
+            "ui_evidence": [{"file": {"id": shot.id, "filename": "home.png", "content_type": "image/png", "size": 3}}],
+            "commits": [{"hash": "a53287d", "message": "Scaffold the monorepo"}],
+        },
+    }
+    assert story_store.get_evidence_file(report.id).attached
+
+
+def test_reordering_within_done_needs_no_evidence_and_other_moves_take_none():
+    story = _create()
+    story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence())
+    assert story_store.move_story(story.id, status="done", position=0.5).position == 0.5
+    with pytest.raises(story_store.EvidenceError, match="only accepted"):
+        story_store.move_story(story.id, status="done", position=2, done_evidence=_evidence())
+    story_store.move_story(story.id, status="in_sprint", position=1)
+    # Coming back to Done needs new evidence.
+    with pytest.raises(story_store.EvidenceError):
+        story_store.move_story(story.id, status="done", position=1)
+
+
+def test_evidence_files_must_belong_to_the_story_and_be_unused():
+    story, other = _create(), _create()
+    theirs = story_store.save_evidence_file(other.id, "report.html", b"<p>ok</p>")
+    with pytest.raises(story_store.EvidenceError, match="not uploaded for this story"):
+        story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence(theirs.id))
+    with pytest.raises(story_store.EvidenceError, match="not uploaded for this story"):
+        story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence("nope"))
+
+    mine = story_store.save_evidence_file(story.id, "report.html", b"<p>ok</p>")
+    with pytest.raises(story_store.EvidenceError, match="already used"):
+        story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence(mine.id, mine.id))
+    # A refused move attaches nothing.
+    assert not story_store.get_evidence_file(mine.id).attached
+    story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence(mine.id))
+    story_store.move_story(story.id, status="in_sprint", position=1)
+    with pytest.raises(story_store.EvidenceError, match="already used"):
+        story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence(mine.id))
+
+
+def test_evidence_file_types_sizes_and_deletes(monkeypatch):
+    story = _create()
+    with pytest.raises(story_store.EvidenceFileTypeError):
+        story_store.save_evidence_file(story.id, "run.sh", b"echo")
+    monkeypatch.setattr(story_store, "MAX_EVIDENCE_BYTES", 4)
+    with pytest.raises(story_store.EvidenceFileTooLargeError):
+        story_store.save_evidence_file(story.id, "log.txt", b"12345")
+    assert story_store.save_evidence_file("nope", "log.txt", b"1") is None
+
+    unused = story_store.save_evidence_file(story.id, "log.txt", b"1")
+    path = story_store.evidence_path(unused)
+    assert path.read_bytes() == b"1"
+    assert story_store.delete_unattached_evidence_file(unused.id)
+    assert not path.exists() and story_store.get_evidence_file(unused.id) is None
+    assert not story_store.delete_unattached_evidence_file(unused.id)
+
+    used = story_store.save_evidence_file(story.id, "log.txt", b"1")
+    story_store.move_story(story.id, status="done", position=1, done_evidence=_evidence(used.id))
+    with pytest.raises(story_store.EvidenceFileAttachedError):
+        story_store.delete_unattached_evidence_file(used.id)
+
+
+def test_deleting_a_story_or_board_removes_its_evidence_files():
+    story = _create()
+    path = story_store.evidence_path(story_store.save_evidence_file(story.id, "log.txt", b"1"))
+    story_store.delete_story(story.id)
+    assert not path.parent.exists()
+
+    board = story_store.create_board(name="Shop", key_prefix="SHP")
+    other = _create(board.id)
+    path = story_store.evidence_path(story_store.save_evidence_file(other.id, "log.txt", b"1"))
+    story_store.delete_board(board.id)
+    assert not path.parent.exists()

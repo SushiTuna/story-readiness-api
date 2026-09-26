@@ -180,6 +180,57 @@ class StoryIn(AssessRequest):
     """A story to store. Same fields and limits as AssessRequest."""
 
 
+class EvidenceItemIn(BaseModel):
+    """One piece of evidence: a file uploaded with POST /stories/{story_id}/evidence, or a link."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    file_id: str | None = Field(None, description="ID of an evidence file uploaded for this story and not used yet.")
+    url: str | None = Field(
+        None, max_length=2000, pattern=r"^https?://\S+$", description="Link to evidence kept elsewhere, e.g. a CI run."
+    )
+    caption: str | None = Field(None, max_length=200, description="Optional short summary, e.g. '42 passed'.")
+
+    @model_validator(mode="after")
+    def _file_or_url(self) -> EvidenceItemIn:
+        if (self.file_id is None) == (self.url is None):
+            raise PydanticCustomError("evidence_source", "Give exactly one of file_id or url.")
+        return self
+
+
+class TestReportIn(EvidenceItemIn):
+    __test__ = False  # not a pytest test class
+
+    kind: Literal["unit", "integration", "cucumber"]
+
+
+class CommitIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    hash: str = Field(pattern=r"^[0-9a-fA-F]{7,40}$", description="Commit hash, 7–40 hex characters.")
+    message: str = Field(min_length=1, max_length=500, description="The commit's description.")
+
+    @model_validator(mode="after")
+    def _lowercase_hash(self) -> CommitIn:
+        self.hash = self.hash.lower()
+        return self
+
+
+class DoneEvidenceIn(BaseModel):
+    """What moving a story into Done requires: test reports, UI evidence for UI changes, and the commits."""
+
+    test_reports: list[TestReportIn] = Field(min_length=1, max_length=10)
+    ui_change: bool = Field(description="The story changes the UI; then ui_evidence needs a screenshot or recording.")
+    ui_evidence: list[EvidenceItemIn] = Field(default_factory=list, max_length=10)
+    commits: list[CommitIn] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def _ui_evidence_for_ui_changes(self) -> DoneEvidenceIn:
+        if self.ui_change and not self.ui_evidence:
+            raise PydanticCustomError("ui_evidence_missing", "A UI change needs at least one screenshot or recording.")
+        return self
+
+
 class StoryMoveIn(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -189,6 +240,11 @@ class StoryMoveIn(BaseModel):
         None,
         max_length=500,
         description="Why the story is blocked. Required when status is blocked; not allowed otherwise.",
+    )
+    done_evidence: DoneEvidenceIn | None = Field(
+        None,
+        description="Evidence that the story is done. Required when the story enters the done column; not allowed "
+        "for other columns.",
     )
 
     @model_validator(mode="after")
@@ -200,7 +256,18 @@ class StoryMoveIn(BaseModel):
         if self.status != StoryStatus.blocked.value and reason is not None:
             raise PydanticCustomError("blocked_reason_not_allowed", "blocked_reason is only allowed when status is blocked.")
         self.blocked_reason = reason
+        # Whether evidence is required depends on the story's current column, which only the store knows.
+        if self.status != StoryStatus.done.value and self.done_evidence is not None:
+            raise PydanticCustomError("done_evidence_not_allowed", "done_evidence is only allowed when status is done.")
         return self
+
+
+class EvidenceFileOut(BaseModel):
+    id: str
+    filename: str
+    content_type: str
+    size: int = Field(description="Size in bytes.")
+    created_at: datetime
 
 
 class AssessmentSummaryOut(BaseModel):
@@ -220,7 +287,11 @@ class ActivityOut(BaseModel):
     action: Literal[
         "board_created", "board_updated", "story_created", "story_edited", "story_moved", "story_assessed", "story_deleted"
     ]
-    detail: dict = Field(description="Action-specific data, e.g. {\"fields\": [\"title\"]} or {\"from\": \"backlog\", \"to\": \"blocked\"}.")
+    detail: dict = Field(
+        description="Action-specific data, e.g. {\"fields\": [\"title\"]} or {\"from\": \"backlog\", \"to\": \"blocked\"}. "
+        "A move into done has an \"evidence\" object: test_reports, ui_change, ui_evidence and commits, with each "
+        "uploaded file's id, filename, content_type and size under \"file\"."
+    )
     note: str | None = Field(description="The agent's reason for the change, or null for UI changes.")
     story_key: str | None = Field(description="Human-readable story key, kept after the story is deleted.")
     created_at: datetime
