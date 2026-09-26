@@ -7,9 +7,17 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.141.1",
     "httpx>=0.28.1",
+    "mcp>=2.2.0",
     "python-dotenv>=1.2.3",
     "typesafe-sdk>=0.7.1",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+story-board-mcp = "app.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/app"]

@@ -332,6 +332,51 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/boards/{board_id}/activity:
+    get:
+      tags:
+      - stories
+      summary: List activity on a board, newest first
+      operationId: listBoardActivity
+      parameters:
+      - name: board_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Board Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 100
+          minimum: 1
+          maximum: 1000
+          title: Limit
+          description: Maximum number of entries to return.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/ActivityOut'
+                type: array
+                title: Response Listboardactivity
+        '404':
+          description: The board was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/boards/{board_id}/stories:
     get:
       tags:
@@ -645,6 +690,61 @@ paths:
                 $ref: '#/components/schemas/ErrorOut'
 components:
   schemas:
+    ActivityOut:
+      properties:
+        actor_kind:
+          type: string
+          enum:
+          - agent
+          - user
+          title: Actor Kind
+          description: '`agent` for the MCP server, `user` for the HTTP API.'
+        actor:
+          type: string
+          title: Actor
+          description: Agent name, or 'board' for the web UI.
+        action:
+          type: string
+          enum:
+          - board_created
+          - board_updated
+          - story_created
+          - story_edited
+          - story_moved
+          - story_assessed
+          - story_deleted
+          title: Action
+        detail:
+          type: object
+          additionalProperties: true
+          title: Detail
+          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}.
+        note:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Note
+          description: The agent's reason for the change, or null for UI changes.
+        story_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Story Key
+          description: Human-readable story key, kept after the story is deleted.
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - actor_kind
+      - actor
+      - action
+      - detail
+      - note
+      - story_key
+      - created_at
+      title: ActivityOut
     AssessRequest:
       properties:
         title:
@@ -1129,6 +1229,13 @@ components:
           type: boolean
           title: Stale
           description: The story was edited after its latest assessment.
+        agents:
+          items:
+            type: string
+          type: array
+          title: Agents
+          description: Names of agents that have acted on this story, oldest first.
+          default: []
         report:
           anyOf:
           - $ref: '#/components/schemas/ReportOut'
@@ -1140,6 +1247,13 @@ components:
           type: array
           title: History
           description: All assessments, newest first.
+        activity:
+          items:
+            $ref: '#/components/schemas/ActivityOut'
+          type: array
+          title: Activity
+          description: Activity log for this story, newest first.
+          default: []
       type: object
       required:
       - id
@@ -1157,8 +1271,10 @@ components:
       - latest
       - previous_quality
       - stale
+      - agents
       - report
       - history
+      - activity
       title: StoredStoryDetailOut
     StoredStoryOut:
       properties:
@@ -1230,6 +1346,13 @@ components:
           type: boolean
           title: Stale
           description: The story was edited after its latest assessment.
+        agents:
+          items:
+            type: string
+          type: array
+          title: Agents
+          description: Names of agents that have acted on this story, oldest first.
+          default: []
       type: object
       required:
       - id
@@ -1247,6 +1370,7 @@ components:
       - latest
       - previous_quality
       - stale
+      - agents
       title: StoredStoryOut
     StoryIn:
       properties:

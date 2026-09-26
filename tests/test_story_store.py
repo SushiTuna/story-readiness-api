@@ -371,3 +371,100 @@ def test_recreated_prefix_does_not_reuse_story_numbers():
     story_store.delete_board(ops.id)
     again = story_store.create_board(name="Ops again", key_prefix="OPS")
     assert _create(again.id).key == "OPS-3"
+
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+
+_AGENT = story_store.Actor("agent", "claude-code", "Tightening the criteria")
+
+
+def _log(story_id: str | None = None) -> list[story_store.ActivityEntry]:
+    return story_store.list_activity(_st_board().id, story_id=story_id)
+
+
+def test_every_write_is_logged_with_its_actor():
+    board = _st_board()
+    story = _create(actor=_AGENT)
+    story_store.update_story(story.id, **{**_STORY, "title": "Export orders"})
+    story_store.move_story(story.id, status="refinement", position=1, actor=_AGENT)
+    story_store.add_assessment(story, _report(0.8), actor=_AGENT)
+
+    entries = _log(story.id)
+    assert [e.action for e in entries] == ["story_assessed", "story_moved", "story_edited", "story_created"]
+    assert [(e.actor_kind, e.actor) for e in entries] == [
+        ("agent", "claude-code"), ("agent", "claude-code"), ("user", "board"), ("agent", "claude-code"),
+    ]
+    assert entries[0].detail == {"verdict": "ready", "quality": 0.8}
+    assert entries[1].detail == {"from": "backlog", "to": "refinement"}
+    assert entries[3].note == "Tightening the criteria"
+    assert entries[2].note is None
+    assert all(e.story_key == "ST-1" and e.board_id == board.id for e in entries)
+
+
+def test_blocked_reason_is_logged():
+    story = _create()
+    story_store.move_story(story.id, status="blocked", position=1, blocked_reason="Waiting on legal")
+    story_store.move_story(story.id, status="backlog", position=1)
+    moved_out, moved_in = _log(story.id)[:2]
+    assert moved_in.detail == {"from": "backlog", "to": "blocked", "blocked_reason": "Waiting on legal"}
+    assert moved_out.detail == {"from": "blocked", "to": "backlog"}
+
+
+def test_edit_logs_only_changed_fields_and_skips_no_ops():
+    story = _create()
+    story_store.update_story(story.id, **_STORY)
+    assert [e.action for e in _log(story.id)] == ["story_created"]
+    story_store.update_story(story.id, **{**_STORY, "description": "New", "definition_of_ready": []})
+    assert _log(story.id)[0].detail == {"fields": ["description", "definition_of_ready"]}
+
+
+def test_board_update_logs_old_and_new_values_and_skips_no_ops():
+    board = _st_board()
+    story_store.update_board(board.id, name="Stories", description="")
+    assert [e.action for e in _log()] == ["board_created"]
+    story_store.update_board(board.id, name="Shop", description="", actor=_AGENT)
+    [updated] = [e for e in _log() if e.action == "board_updated"]
+    assert updated.detail == {"from": {"name": "Stories"}, "to": {"name": "Shop"}}
+    assert updated.actor == "claude-code"
+
+
+def test_deleted_story_keeps_its_log_under_its_key():
+    story = _create(actor=_AGENT)
+    assert story_store.delete_story(story.id)
+    deleted, created = _log()[:2]
+    assert (deleted.action, deleted.story_key, deleted.story_id) == ("story_deleted", "ST-1", None)
+    assert (created.action, created.story_key, created.story_id) == ("story_created", "ST-1", None)
+
+
+def test_agents_by_story_lists_distinct_agents_oldest_first():
+    first, second = _create(), _create()
+    other = story_store.Actor("agent", "copilot", "Reordering")
+    for actor in (_AGENT, other, _AGENT):
+        story_store.move_story(first.id, status="refinement", position=1, actor=actor)
+    story_store.move_story(second.id, status="refinement", position=2)  # a board user, not an agent
+    assert story_store.agents_by_story(_st_board().id) == {first.id: ["claude-code", "copilot"]}
+
+
+def test_list_activity_filters_by_story_and_limits():
+    first, second = _create(), _create()
+    assert [e.story_id for e in _log(first.id)] == [first.id]
+    assert [e.story_id for e in story_store.list_activity(_st_board().id, limit=1)] == [second.id]
+
+
+def test_lookup_by_key_and_prefix():
+    story = _create()
+    assert story_store.get_story_by_key("ST-1").id == story.id
+    assert story_store.get_story_by_key("st-1").id == story.id
+    for bad in ("ST-2", "ST", "ST-x", "XX-1", ""):
+        assert story_store.get_story_by_key(bad) is None
+    assert story_store.get_board_by_prefix("st").id == _st_board().id
+    assert story_store.get_board_by_prefix("NOPE") is None
+
+
+def test_column_bounds():
+    board = _st_board()
+    assert story_store.column_bounds(board.id, "backlog") is None
+    _create(), _create()
+    assert story_store.column_bounds(board.id, "backlog") == (1, 2)

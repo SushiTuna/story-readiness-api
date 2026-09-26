@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Query, Response
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -17,6 +17,7 @@ from app import engine, story_store
 from app.jev_client import JevError
 from app.routers.errors import board_full, board_not_found, jev_unavailable, too_large
 from app.schemas import (
+    ActivityOut,
     AssessmentSummaryOut,
     AssessRequest,
     ErrorOut,
@@ -51,7 +52,19 @@ def _summary(assessment: Assessment) -> AssessmentSummaryOut:
     )
 
 
-def _fields(story: StoredStory, recent: list[Assessment]) -> dict:
+def _activity_out(entry: story_store.ActivityEntry) -> ActivityOut:
+    return ActivityOut(
+        actor_kind=entry.actor_kind,
+        actor=entry.actor,
+        action=entry.action,
+        detail=entry.detail,
+        note=entry.note,
+        story_key=entry.story_key,
+        created_at=entry.created_at,
+    )
+
+
+def _fields(story: StoredStory, recent: list[Assessment], agents: list[str] | None = None) -> dict:
     """Output fields shared by the list and detail views; *recent* is newest first."""
     latest = recent[0] if recent else None
     return {
@@ -70,6 +83,7 @@ def _fields(story: StoredStory, recent: list[Assessment]) -> dict:
         "latest": _summary(latest) if latest else None,
         "previous_quality": recent[1].quality if len(recent) > 1 else None,
         "stale": latest is not None and latest.fingerprint != story.fingerprint,
+        "agents": agents if agents is not None else [],
     }
 
 
@@ -92,7 +106,29 @@ def _story_kwargs(body: StoryIn) -> dict:
 def list_stories(board_id: str) -> list[StoredStoryOut] | JSONResponse:
     if story_store.get_board(board_id) is None:
         return board_not_found()
-    return [StoredStoryOut(**_fields(story, recent)) for story, recent in story_store.list_stories(board_id)]
+    pairs = story_store.list_stories(board_id)
+    agents_map = story_store.agents_by_story(board_id)
+    return [
+        StoredStoryOut(**_fields(story, recent, agents_map.get(story.id, [])))
+        for story, recent in pairs
+    ]
+
+
+@router.get(
+    "/boards/{board_id}/activity",
+    response_model=list[ActivityOut],
+    operation_id="listBoardActivity",
+    summary="List activity on a board, newest first",
+    responses=_BOARD_NOT_FOUND,
+)
+def list_board_activity(
+    board_id: str,
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of entries to return."),
+) -> list[ActivityOut] | JSONResponse:
+    if story_store.get_board(board_id) is None:
+        return board_not_found()
+    entries = story_store.list_activity(board_id, limit=limit)
+    return [_activity_out(e) for e in entries]
 
 
 @router.post(
@@ -130,10 +166,13 @@ def get_story(story_id: str) -> StoredStoryDetailOut | JSONResponse:
     if story is None:
         return _not_found()
     history = story_store.list_assessments(story_id)
+    agents_map = story_store.agents_by_story(story.board_id)
+    activity = story_store.list_activity(story.board_id, story_id=story_id)
     return StoredStoryDetailOut(
-        **_fields(story, history),
+        **_fields(story, history, agents_map.get(story_id, [])),
         report=history[0].report() if history else None,
         history=[_summary(a) for a in history],
+        activity=[_activity_out(e) for e in activity],
     )
 
 

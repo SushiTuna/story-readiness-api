@@ -214,3 +214,51 @@ async def test_move_blocked_reason_rules_are_422(client, body):
     resp = await client.put(f"/api/stories/{story['id']}/move", json=body)
     assert resp.status_code == 422
     assert resp.json()["detail"]  # JSON-serialisable validation errors
+
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+
+
+async def test_board_changes_are_logged_as_the_board_user(client, monkeypatch):
+    _mock_assess(monkeypatch, 0.8)
+    story = await _create(client)
+    await client.put(f"/api/stories/{story['id']}", json={**_BODY, "title": "Export orders"})
+    await client.put(f"/api/stories/{story['id']}/move", json={"status": "blocked", "position": 1, "blocked_reason": "Legal"})
+    await client.post(f"/api/stories/{story['id']}/assess")
+
+    detail = (await client.get(f"/api/stories/{story['id']}")).json()
+    assert [a["action"] for a in detail["activity"]] == ["story_assessed", "story_moved", "story_edited", "story_created"]
+    assert {(a["actor_kind"], a["actor"], a["note"]) for a in detail["activity"]} == {("user", "board", None)}
+    assert detail["activity"][1]["detail"] == {"from": "backlog", "to": "blocked", "blocked_reason": "Legal"}
+    assert detail["agents"] == []
+
+
+async def test_agents_show_on_list_and_detail(client):
+    story = await _create(client)
+    story_store.move_story(
+        story["id"], status="refinement", position=1, actor=story_store.Actor("agent", "claude-code", "Ready to refine")
+    )
+    [listed] = (await client.get(_stories_url())).json()
+    assert listed["agents"] == ["claude-code"]
+    detail = (await client.get(f"/api/stories/{story['id']}")).json()
+    assert detail["agents"] == ["claude-code"]
+    assert detail["activity"][0]["note"] == "Ready to refine"
+
+
+async def test_board_activity_endpoint(client):
+    [board] = story_store.list_boards()
+    await _create(client)
+    await _create(client)
+    url = f"/api/boards/{board.id}/activity"
+    entries = (await client.get(url)).json()
+    assert [(a["action"], a["story_key"]) for a in entries] == [
+        ("story_created", "ST-2"), ("story_created", "ST-1"), ("board_created", None),
+    ]
+    assert len((await client.get(url, params={"limit": 1})).json()) == 1
+    assert (await client.get(url, params={"limit": 0})).status_code == 422
+    assert (await client.get(url, params={"limit": 1001})).status_code == 422
+    missing = await client.get("/api/boards/nope/activity")
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "The board was not found."}

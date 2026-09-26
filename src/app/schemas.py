@@ -212,6 +212,20 @@ class AssessmentSummaryOut(BaseModel):
     created_at: datetime
 
 
+class ActivityOut(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    actor_kind: Literal["agent", "user"] = Field(description="`agent` for the MCP server, `user` for the HTTP API.")
+    actor: str = Field(description="Agent name, or 'board' for the web UI.")
+    action: Literal[
+        "board_created", "board_updated", "story_created", "story_edited", "story_moved", "story_assessed", "story_deleted"
+    ]
+    detail: dict = Field(description="Action-specific data, e.g. {\"fields\": [\"title\"]} or {\"from\": \"backlog\", \"to\": \"blocked\"}.")
+    note: str | None = Field(description="The agent's reason for the change, or null for UI changes.")
+    story_key: str | None = Field(description="Human-readable story key, kept after the story is deleted.")
+    created_at: datetime
+
+
 class StoredStoryOut(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -232,11 +246,13 @@ class StoredStoryOut(BaseModel):
     latest: AssessmentSummaryOut | None = Field(description="The latest assessment, or null if never assessed.")
     previous_quality: float | None = Field(description="Quality of the assessment before the latest one.")
     stale: bool = Field(description="The story was edited after its latest assessment.")
+    agents: list[str] = Field(default_factory=list, description="Names of agents that have acted on this story, oldest first.")
 
 
 class StoredStoryDetailOut(StoredStoryOut):
     report: ReportOut | None = Field(description="Full report of the latest assessment.")
     history: list[AssessmentSummaryOut] = Field(description="All assessments, newest first.")
+    activity: list[ActivityOut] = Field(default_factory=list, description="Activity log for this story, newest first.")
 
 
 # ---------------------------------------------------------------------------

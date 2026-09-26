@@ -19,9 +19,14 @@ def _error(status_code: int, detail: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=ErrorOut(detail=detail).model_dump())
 
 
+def is_too_large(description: str, ac: str) -> bool:
+    """Return True if either field exceeds 10 000 chars."""
+    return len(description) > MAX_TEXT_CHARS or len(ac) > MAX_TEXT_CHARS
+
+
 def too_large(description: str, ac: str) -> JSONResponse | None:
     """Return a 413 JSONResponse if either field exceeds 10 000 chars, else None."""
-    if len(description) > MAX_TEXT_CHARS or len(ac) > MAX_TEXT_CHARS:
+    if is_too_large(description, ac):
         return _error(413, "The story is longer than the size limit.")
     return None
 

@@ -13,7 +13,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -71,6 +71,20 @@ CREATE TABLE IF NOT EXISTS assessments (
     created_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS assessments_story ON assessments(story_id, id);
+CREATE TABLE IF NOT EXISTS activity (
+    id         INTEGER PRIMARY KEY,
+    board_id   TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+    story_id   TEXT REFERENCES stories(id) ON DELETE SET NULL,
+    story_key  TEXT,
+    actor_kind TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    detail     TEXT NOT NULL,
+    note       TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS activity_story ON activity(story_id, id);
+CREATE INDEX IF NOT EXISTS activity_board ON activity(board_id, id);
 """
 
 
@@ -84,6 +98,16 @@ class BoardFullError(Exception):
 
 class DuplicateKeyPrefixError(Exception):
     """Another board already uses this key prefix."""
+
+
+@dataclass
+class Actor:
+    kind: str   # 'agent' | 'user'
+    name: str
+    note: str | None = None
+
+
+BOARD_USER = Actor("user", "board")
 
 
 @dataclass
@@ -135,6 +159,20 @@ class Assessment:
         return ReportOut.model_validate_json(self.report_json) if self.report_json else None
 
 
+@dataclass
+class ActivityEntry:
+    id: int
+    board_id: str
+    story_id: str | None
+    story_key: str | None
+    actor_kind: str
+    actor: str
+    action: str
+    detail: dict
+    note: str | None
+    created_at: datetime
+
+
 def story_fingerprint(title: str, description: str, acceptance_criteria: str, definition_of_ready: list[str]) -> str:
     """Hash of everything the assessment reads; a change marks the latest assessment stale."""
     return issue_fingerprint(title, "\n".join([description, acceptance_criteria, *definition_of_ready]))
@@ -148,7 +186,7 @@ def _db_path() -> Path:
 def _connect() -> Iterator[sqlite3.Connection]:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
@@ -204,6 +242,50 @@ def _assessment(row: sqlite3.Row) -> Assessment:
         fingerprint=row["fingerprint"],
         created_at=datetime.fromisoformat(row["created_at"]),
         report_json=row["report_json"] if "report_json" in row.keys() else None,
+    )
+
+
+def _activity(row: sqlite3.Row) -> ActivityEntry:
+    return ActivityEntry(
+        id=row["id"],
+        board_id=row["board_id"],
+        story_id=row["story_id"],
+        story_key=row["story_key"],
+        actor_kind=row["actor_kind"],
+        actor=row["actor"],
+        action=row["action"],
+        detail=json.loads(row["detail"]),
+        note=row["note"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _log_activity(
+    conn: sqlite3.Connection,
+    *,
+    board_id: str,
+    story_id: str | None,
+    story_key: str | None,
+    actor: Actor,
+    action: str,
+    detail: dict,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO activity (board_id, story_id, story_key, actor_kind, actor, action, detail, note, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            board_id,
+            story_id,
+            story_key,
+            actor.kind,
+            actor.name,
+            action,
+            json.dumps(detail),
+            actor.note,
+            _now().isoformat(),
+        ),
     )
 
 
@@ -288,11 +370,21 @@ def _insert_board(conn: sqlite3.Connection, name: str, key_prefix: str, descript
     return board
 
 
-def create_board(*, name: str, key_prefix: str, description: str = "") -> Board:
+def create_board(*, name: str, key_prefix: str, description: str = "", actor: Actor = BOARD_USER) -> Board:
     """Create an empty board. Raises DuplicateKeyPrefixError if another board uses *key_prefix*."""
     try:
         with _connect() as conn:
-            return _insert_board(conn, name, key_prefix, description)
+            board = _insert_board(conn, name, key_prefix, description)
+            _log_activity(
+                conn,
+                board_id=board.id,
+                story_id=None,
+                story_key=None,
+                actor=actor,
+                action="board_created",
+                detail={"name": name, "key_prefix": key_prefix},
+            )
+            return board
     except sqlite3.IntegrityError as exc:
         raise DuplicateKeyPrefixError(key_prefix) from exc
 
@@ -309,13 +401,38 @@ def get_board(board_id: str) -> Board | None:
     return _board(row) if row else None
 
 
-def update_board(board_id: str, *, name: str, description: str) -> Board | None:
-    """Rename a board or change its description. The key prefix never changes."""
+def get_board_by_prefix(prefix: str) -> Board | None:
+    """Look up a board by its key prefix (e.g. 'FLW')."""
     with _connect() as conn:
-        cur = conn.execute("UPDATE boards SET name = ?, description = ? WHERE id = ?", (name, description, board_id))
-        if cur.rowcount == 0:
+        row = conn.execute(
+            f"{_SELECT_BOARD} WHERE boards.key_prefix = ?", (prefix.upper(),)
+        ).fetchone()
+    return _board(row) if row else None
+
+
+def update_board(board_id: str, *, name: str, description: str, actor: Actor = BOARD_USER) -> Board | None:
+    """Rename a board or change its description. The key prefix never changes.
+
+    Logs the changed fields' old and new values; a call that changes nothing is not logged.
+    """
+    with _connect() as conn:
+        old = conn.execute("SELECT name, description FROM boards WHERE id = ?", (board_id,)).fetchone()
+        if old is None:
             return None
+        new = {"name": name, "description": description}
+        changed = [f for f in new if old[f] != new[f]]
+        conn.execute("UPDATE boards SET name = ?, description = ? WHERE id = ?", (name, description, board_id))
         row = conn.execute(f"{_SELECT_BOARD} WHERE boards.id = ?", (board_id,)).fetchone()
+        if changed:
+            _log_activity(
+                conn,
+                board_id=board_id,
+                story_id=None,
+                story_key=None,
+                actor=actor,
+                action="board_updated",
+                detail={"from": {f: old[f] for f in changed}, "to": {f: new[f] for f in changed}},
+            )
     return _board(row)
 
 
@@ -336,7 +453,13 @@ def delete_board(board_id: str) -> bool:
 
 
 def create_story(
-    board_id: str, *, title: str, description: str, acceptance_criteria: str, definition_of_ready: list[str]
+    board_id: str,
+    *,
+    title: str,
+    description: str,
+    acceptance_criteria: str,
+    definition_of_ready: list[str],
+    actor: Actor = BOARD_USER,
 ) -> StoredStory:
     """Add a story to the end of a board's backlog.
 
@@ -391,12 +514,42 @@ def create_story(
                 story.board_id,
             ),
         )
+        _log_activity(
+            conn,
+            board_id=board_id,
+            story_id=story.id,
+            story_key=story.key,
+            actor=actor,
+            action="story_created",
+            detail={"title": title},
+        )
     return story
 
 
 def get_story(story_id: str) -> StoredStory | None:
     with _connect() as conn:
         row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+    return _story(row) if row else None
+
+
+def get_story_by_key(key: str) -> StoredStory | None:
+    """Look up a story by its human-readable key, e.g. 'FLW-12'."""
+    parts = key.split("-", 1)
+    if len(parts) != 2:
+        return None
+    prefix, num_str = parts
+    try:
+        number = int(num_str)
+    except ValueError:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            f"""
+            {_SELECT_STORY}
+            WHERE boards.key_prefix = ? AND stories.number = ?
+            """,
+            (prefix.upper(), number),
+        ).fetchone()
     return _story(row) if row else None
 
 
@@ -425,10 +578,64 @@ def list_stories(board_id: str) -> list[tuple[StoredStory, list[Assessment]]]:
     return [(story, recent.get(story.id, [])) for story in stories]
 
 
+def agents_by_story(board_id: str) -> dict[str, list[str]]:
+    """Return distinct agent names per story_id (oldest first) for a board.
+
+    Only includes entries from actors with kind='agent'.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT story_id, actor FROM activity
+            WHERE board_id = ? AND actor_kind = 'agent' AND story_id IS NOT NULL
+            ORDER BY id ASC
+            """,
+            (board_id,),
+        ).fetchall()
+    result: dict[str, list[str]] = {}
+    for row in rows:
+        sid = row["story_id"]
+        name = row["actor"]
+        if sid not in result:
+            result[sid] = []
+        if name not in result[sid]:
+            result[sid].append(name)
+    return result
+
+
+def column_bounds(board_id: str, status: str) -> tuple[float, float] | None:
+    """Lowest and highest position in one column of a board, or None if the column is empty."""
+    with _connect() as conn:
+        low, high = conn.execute(
+            "SELECT MIN(position), MAX(position) FROM stories WHERE board_id = ? AND status = ?", (board_id, status)
+        ).fetchone()
+    return None if low is None else (low, high)
+
+
 def update_story(
-    story_id: str, *, title: str, description: str, acceptance_criteria: str, definition_of_ready: list[str]
+    story_id: str,
+    *,
+    title: str,
+    description: str,
+    acceptance_criteria: str,
+    definition_of_ready: list[str],
+    actor: Actor = BOARD_USER,
 ) -> StoredStory | None:
     with _connect() as conn:
+        # Read current values to compute changed fields.
+        old_row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if old_row is None:
+            return None
+        old = _story(old_row)
+        changed = []
+        if old.title != title:
+            changed.append("title")
+        if old.description != description:
+            changed.append("description")
+        if old.acceptance_criteria != acceptance_criteria:
+            changed.append("acceptance_criteria")
+        if old.definition_of_ready != definition_of_ready:
+            changed.append("definition_of_ready")
         cur = conn.execute(
             """
             UPDATE stories
@@ -440,11 +647,26 @@ def update_story(
         if cur.rowcount == 0:
             return None
         row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if changed:  # saving unchanged text is not an edit worth logging
+            _log_activity(
+                conn,
+                board_id=old.board_id,
+                story_id=story_id,
+                story_key=old.key,
+                actor=actor,
+                action="story_edited",
+                detail={"fields": changed},
+            )
     return _story(row)
 
 
 def move_story(
-    story_id: str, *, status: str, position: float, blocked_reason: str | None = None
+    story_id: str,
+    *,
+    status: str,
+    position: float,
+    blocked_reason: str | None = None,
+    actor: Actor = BOARD_USER,
 ) -> StoredStory | None:
     """Put a story in a workflow column at *position*. Does not touch updated_at: moving is not an edit.
 
@@ -454,6 +676,13 @@ def move_story(
         raise ValueError(f"Unknown status: {status}")
     reason = blocked_reason if status == "blocked" else None
     with _connect() as conn:
+        # Read old status before updating.
+        old_row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if old_row is None:
+            return None
+        old_status = old_row["status"]
+        board_id = old_row["board_id"]
+        story_key = f"{old_row['key_prefix']}-{old_row['number']}"
         cur = conn.execute(
             "UPDATE stories SET status = ?, position = ?, blocked_reason = ? WHERE id = ?",
             (status, position, reason, story_id),
@@ -461,17 +690,46 @@ def move_story(
         if cur.rowcount == 0:
             return None
         row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        detail: dict = {"from": old_status, "to": status}
+        if reason:
+            detail["blocked_reason"] = reason
+        _log_activity(
+            conn,
+            board_id=board_id,
+            story_id=story_id,
+            story_key=story_key,
+            actor=actor,
+            action="story_moved",
+            detail=detail,
+        )
     return _story(row)
 
 
-def delete_story(story_id: str) -> bool:
+def delete_story(story_id: str, actor: Actor = BOARD_USER) -> bool:
     """Delete a story and, through ON DELETE CASCADE, its assessments. Returns False if it did not exist."""
     with _connect() as conn:
+        # Read the key first: the story's activity rows keep it after ON DELETE SET NULL clears their story_id.
+        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if row is None:
+            return False
+        board_id = row["board_id"]
+        story_key = f"{row['key_prefix']}-{row['number']}"
         cur = conn.execute("DELETE FROM stories WHERE id = ?", (story_id,))
-    return cur.rowcount > 0
+        if cur.rowcount == 0:
+            return False
+        _log_activity(
+            conn,
+            board_id=board_id,
+            story_id=None,
+            story_key=story_key,
+            actor=actor,
+            action="story_deleted",
+            detail={"key": story_key},
+        )
+    return True
 
 
-def add_assessment(story: StoredStory, report: ReportOut) -> Assessment:
+def add_assessment(story: StoredStory, report: ReportOut, actor: Actor = BOARD_USER) -> Assessment:
     """Save *report* as the latest assessment of *story*, fingerprinting the text that was assessed."""
     questions, _notes = author_questions(report)
     assessment = Assessment(
@@ -499,6 +757,20 @@ def add_assessment(story: StoredStory, report: ReportOut) -> Assessment:
                 assessment.created_at.isoformat(),
             ),
         )
+        # Look up board_id and story_key for the activity log.
+        story_row = conn.execute(
+            f"{_SELECT_STORY} WHERE stories.id = ?", (story.id,)
+        ).fetchone()
+        if story_row is not None:
+            _log_activity(
+                conn,
+                board_id=story_row["board_id"],
+                story_id=story.id,
+                story_key=f"{story_row['key_prefix']}-{story_row['number']}",
+                actor=actor,
+                action="story_assessed",
+                detail={"verdict": report.verdict, "quality": report.quality},
+            )
     return assessment
 
 
@@ -509,3 +781,19 @@ def list_assessments(story_id: str) -> list[Assessment]:
             "SELECT * FROM assessments WHERE story_id = ? ORDER BY id DESC", (story_id,)
         ).fetchall()
     return [_assessment(r) for r in rows]
+
+
+def list_activity(board_id: str, story_id: str | None = None, limit: int = 100) -> list[ActivityEntry]:
+    """Activity entries for a board (or a specific story), newest first."""
+    with _connect() as conn:
+        if story_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM activity WHERE board_id = ? AND story_id = ? ORDER BY id DESC LIMIT ?",
+                (board_id, story_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM activity WHERE board_id = ? ORDER BY id DESC LIMIT ?",
+                (board_id, limit),
+            ).fetchall()
+    return [_activity(r) for r in rows]

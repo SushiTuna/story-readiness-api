@@ -49,6 +49,7 @@ PYTHONPATH=src uv run pytest -v
 | `LINEAR_TRIGGER_LABEL` | Optional | Label name that triggers auto-assessment (default: `ready-check`) |
 | `LINEAR_WEBHOOK_CAPTURE_DIR` | Optional | Development only: save each verified webhook delivery (without its signature) to this directory, for test fixtures |
 | `STORIES_DB_PATH` | Optional | SQLite file for stored stories and their assessment history (default: `data/stories.db`, git-ignored) |
+| `STORY_AGENT_NAME` | Optional | MCP server only: the name its changes are logged under (default: the name the MCP client reports, else `mcp-agent`) |
 
 ## API Overview
 
@@ -122,6 +123,8 @@ Pasted stories can be kept in a SQLite database (`STORIES_DB_PATH`, created on s
 - `POST /api/stories/{id}/assess` costs one Jev call and adds a row to the history. Editing a story keeps its history.
 - Each story also has a workflow `status` (`backlog`, `refinement`, `ready_for_sprint`, `in_sprint`, `done`, `blocked`) and a `position` within that column, set with `PUT /api/stories/{id}/move`. Moving is not an edit: it does not mark the story stale.
 - Moving to `blocked` requires a `blocked_reason` (up to 500 characters), which is returned with the story. Moving to any other column clears it; sending a reason with another status is a `422`.
+- Every change to a board or story is written to an **activity log** in the same transaction: who made it (`actor_kind` `user` with `actor` `board` for the HTTP API, or `agent` with the agent's name for the [MCP server](#mcp-server-for-ai-agents)), what changed (`action` and `detail`, e.g. the columns of a move or the fields of an edit), the agent's `note`, and when. Saving unchanged text is not logged. A deleted story's entries keep its `story_key`. `GET /api/stories/{id}` returns the story's `activity`, newest first; `GET /api/boards/{id}/activity?limit=100` returns the whole board's.
+- Each story lists the `agents` that have changed it, oldest first. The list comes from the log, so editing a story can't remove it.
 - Like the rest of `/api/*`, these endpoints have no authentication. Anyone who can reach the server can read and delete stored stories.
 
 #### Example backlog
@@ -147,6 +150,37 @@ curl -X POST http://localhost:8000/api/sources/linear/assess \
 ```
 
 When `post_comment` is true the response includes an `X-Linear-Comment: posted|failed` header. A comment failure does **not** affect the HTTP status — the assessment is still returned.
+
+## MCP server for AI agents
+
+`story-board-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server (stdio, built on the `mcp` Python SDK) that lets AI agents work on the boards. It reads and writes the same SQLite file as the API (`STORIES_DB_PATH`), so the API doesn't need to be running; the [story-board](../story-board) UI shows agent changes the next time it refetches (e.g. when its window regains focus).
+
+Setup for Claude Code, GitHub Copilot CLI and OpenAI Codex CLI is in [MCP_INSTALLATION.md](MCP_INSTALLATION.md). In short, for Claude Code (use the absolute path of this repo):
+
+```bash
+claude mcp add story-board -- uv run --directory /abs/path/story-refinement story-board-mcp
+```
+
+Other MCP clients take the same command: `uv run --directory /abs/path/story-refinement story-board-mcp`. To try it by hand: `npx @modelcontextprotocol/inspector uv run --directory /abs/path/story-refinement story-board-mcp`.
+
+| Tool | What it does |
+|---|---|
+| `list_boards` | Boards with `story_count` and `story_limit` |
+| `list_stories(board, status?)` | A board's stories: key, title, column, verdict, quality, stale, blocked reason, agents |
+| `get_story(story)` | Full text, the latest report (checks and questions for the author), assessment history and activity |
+| `get_activity(board, story?, limit?)` | The activity log, newest first |
+| `create_board(name, key_prefix, note, description?)` | New board |
+| `update_board(board, note, name?, description?)` | Rename a board or change its description |
+| `create_story(board, title, note, description?, acceptance_criteria?, definition_of_ready?)` | New story at the end of the backlog |
+| `update_story(story, note, title?, description?, acceptance_criteria?, definition_of_ready?)` | Change only the given fields; marks the story stale |
+| `move_story(story, status, note, place?, blocked_reason?)` | Move to the `top` or `bottom` (default) of a column; `blocked` needs a reason |
+| `assess_story(story, note)` | Assess with Jev (one call) and save the report |
+
+- `board` is a board id or key prefix (`FLW`); `story` is a story id or key (`FLW-12`).
+- There are no delete tools.
+- The same limits and rules as the HTTP API apply (100 stories per board, text size limit, the blocked reason).
+- **Every write needs a `note`** (1–500 characters) that says why. The change is logged under the agent's name with that note, and the agent's name is shown on the story's card on the board.
+- The agent's name is `STORY_AGENT_NAME` if set, else the name the MCP client reports about itself in its `initialize` request (`clientInfo.name`). The name is not verified: it records which agent made a change, not who is allowed to.
 
 ## Linear Webhook Setup
 
