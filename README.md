@@ -30,6 +30,22 @@ PYTHONPATH=src uv run uvicorn app.main:app --reload
 
 API docs available at http://localhost:8000/docs
 
+## Run with containers
+
+Runs the API and the [story-board](../story-board) web app together. `compose.yaml` builds `../story-board`, so keep both folders side by side. Tested with Podman (`podman compose` uses `podman-compose`); `docker compose` takes the same file.
+
+```bash
+cp .env.example .env        # set TYPESAFE_API_KEY
+podman compose up --build   # board at http://localhost:8080
+```
+
+- The board's nginx serves the built app and proxies `/api` to the API container, the same way the Vite dev server does, so no CORS setup is needed.
+- The SQLite database and the evidence files are in `./data` on your machine (bind-mounted to `/data`), so they survive `podman compose down`. Point `STORIES_DB_PATH` for the MCP server at `data/stories.db` in this folder so agents and the board share the same data.
+- The API isn't published on the host. For http://localhost:8000/docs or the Linear webhook, uncomment `ports` under `api` in `compose.yaml`.
+- To fill the board with the example backlog: `podman exec story-api python scripts/seed_example_stories.py --no-assess`
+- If port 8080 is taken, pick another: `BOARD_PORT=8081 podman compose up --build`.
+- After changing `.env`, run `podman compose up -d --force-recreate api`.
+
 ## Testing
 
 ```bash
@@ -179,7 +195,7 @@ Setup for Claude Code, GitHub Copilot CLI and OpenAI Codex CLI is in [MCP_INSTAL
 claude mcp add story-board -- uv run --directory /abs/path/story-refinement story-board-mcp
 ```
 
-Other MCP clients take the same command: `uv run --directory /abs/path/story-refinement story-board-mcp`. To try it by hand: `npx @modelcontextprotocol/inspector uv run --directory /abs/path/story-refinement story-board-mcp`.
+Other MCP clients take the same command: `uv run --directory /abs/path/story-refinement story-board-mcp`. To run it without cloning the repo, use uvx; see [Install with uvx](MCP_INSTALLATION.md#6-install-with-uvx-no-clone). To try it by hand: `npx @modelcontextprotocol/inspector uv run --directory /abs/path/story-refinement story-board-mcp`.
 
 | Tool | What it does |
 |---|---|

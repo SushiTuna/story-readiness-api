@@ -9,6 +9,7 @@ This guide covers **Claude Code**, **GitHub Copilot CLI** and **OpenAI Codex CLI
 - [3. GitHub Copilot CLI](#3-github-copilot-cli)
 - [4. OpenAI Codex CLI](#4-openai-codex-cli)
 - [5. Try it](#5-try-it)
+- [6. Install with uvx (no clone)](#6-install-with-uvx-no-clone)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -219,6 +220,54 @@ Every write tool requires a `note` (1–500 characters) saying why the change wa
 
 ---
 
+## 6. Install with uvx (no clone)
+
+[uvx](https://docs.astral.sh/uv/guides/tools/) builds the package from the git repository into its own cached environment and runs `story-board-mcp`, so you don't need a clone or `uv sync`. Two things are different from `uv run --directory`:
+
+- **The `.env` file isn't read**, because the server no longer runs from this folder. Pass `TYPESAFE_API_KEY` (and `STORY_AGENT_NAME` if you want) in the client's server config.
+- **Set `STORIES_DB_PATH` to an absolute path.** The default `data/stories.db` is relative to wherever the client starts the server, so each client would get its own empty database. To share data with the board, use the `data/stories.db` of the clone that runs the API, or of the container setup ([Run with containers](README.md#run-with-containers)).
+
+At startup the server logs `Story database: <absolute path>` to stderr, so you can check which file it uses in the client's MCP logs.
+
+Claude Code:
+
+```bash
+claude mcp add story-board \
+  -e TYPESAFE_API_KEY=your-key \
+  -e STORIES_DB_PATH=/abs/path/story-refinement/data/stories.db \
+  -- uvx --from git+https://github.com/SushiTuna/ibm-hackathon-template story-board-mcp
+```
+
+Other clients take the same command, arguments and environment, for example in JSON:
+
+```json
+{
+  "mcpServers": {
+    "story-board": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/SushiTuna/ibm-hackathon-template", "story-board-mcp"],
+      "env": {
+        "TYPESAFE_API_KEY": "your-key",
+        "STORIES_DB_PATH": "/abs/path/story-refinement/data/stories.db"
+      }
+    }
+  }
+}
+```
+
+- uvx keeps the version it built. To pick up new commits, run `uvx --refresh --from git+https://github.com/SushiTuna/ibm-hackathon-template story-board-mcp` once, or pin a release with `git+https://…@v0.1.0`.
+- From a local clone, `uvx --from /abs/path/story-refinement story-board-mcp` works the same way.
+
+**Running the containers?** If agent changes don't show up, or you see `database is locked`, while the API runs in a container, let the agent use the MCP server inside that container instead, so both write the file from the same place. Use this as the command:
+
+```bash
+podman exec -i story-api story-board-mcp
+```
+
+It uses the container's `.env` and database, so no `env` block is needed. The container must be running.
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -230,6 +279,7 @@ Every write tool requires a `note` (1–500 characters) saying why the change wa
 | `assess_story` fails with "Assessment service unavailable" | Set `TYPESAFE_API_KEY` in `.env`. `assess_story` makes one TypeSafe/Jev call each time it runs. |
 | "note is required" | Every write tool needs a note. Ask the agent to say why it's making the change. |
 | "A blocked story needs a blocked_reason" | Moving a story to `blocked` requires `blocked_reason`. |
+| The agent sees an empty board under uvx | `STORIES_DB_PATH` is missing or relative. Check the `Story database:` line in the client's MCP logs and set an absolute path ([section 6](#6-install-with-uvx-no-clone)). |
 | Changes are logged under an unexpected name | Set `STORY_AGENT_NAME` in that client's server config. |
 
 ---
@@ -241,4 +291,5 @@ The client commands and config formats come from each client's own documentation
 - Claude Code: [Connect Claude Code to tools via MCP](https://code.claude.com/docs/en/mcp), and `claude mcp add --help` (Claude Code 2.1.283)
 - GitHub Copilot CLI: [Adding MCP servers for GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers), [Using GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli), and `copilot mcp add --help` (Copilot CLI 1.0.87)
 - OpenAI Codex CLI: [Model Context Protocol – Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+- uvx: [Using tools – uv](https://docs.astral.sh/uv/guides/tools/)
 - MCP Inspector: [modelcontextprotocol/inspector](https://github.com/modelcontextprotocol/inspector)

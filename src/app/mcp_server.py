@@ -740,6 +740,8 @@ async def assess_story(story: str, note: Note, ctx: Context) -> StoryDetailMcpOu
 
 def main() -> None:
     story_store.init_db()
+    # Show which database this agent writes to: under uvx a relative path lands in the client's working directory
+    logger.info("Story database: %s", story_store._db_path().resolve())
     _server.run("stdio")
 
 
