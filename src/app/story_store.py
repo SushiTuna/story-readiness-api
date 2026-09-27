@@ -31,6 +31,9 @@ STATUSES = ("backlog", "refinement", "ready_for_sprint", "in_sprint", "done", "b
 REFINING_VERDICTS = {"discuss": "Discuss", "needs_refinement": "Needs refinement"}
 REFINING_STATUSES = ("backlog", "refinement")
 
+# A story may only enter these columns once every story it waits on is done. It can still be reordered in them.
+WAITING_STATUSES = ("in_sprint", "done")
+
 # Each board is scoped to one goal and holds at most this many stories, whatever their column.
 MAX_STORIES_PER_BOARD = 100
 
@@ -104,6 +107,13 @@ CREATE TABLE IF NOT EXISTS evidence_files (
     attached     INTEGER NOT NULL DEFAULT 0  -- 1 once a move to Done uses it; attached files can't be deleted
 );
 CREATE INDEX IF NOT EXISTS evidence_files_story ON evidence_files(story_id);
+CREATE TABLE IF NOT EXISTS story_blockers (
+    story_id   TEXT NOT NULL REFERENCES stories(id) ON DELETE CASCADE,  -- the story that waits
+    blocker_id TEXT NOT NULL REFERENCES stories(id) ON DELETE CASCADE,  -- the story it waits on, same board
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (story_id, blocker_id)
+);
+CREATE INDEX IF NOT EXISTS story_blockers_blocker ON story_blockers(blocker_id);
 """
 
 
@@ -133,6 +143,18 @@ class HumanOnlyError(Exception):
 
 class ParentNotFoundError(Exception):
     """The story to split from does not exist on the same board."""
+
+
+class BlockerNotFoundError(Exception):
+    """The story to wait on does not exist on the same board."""
+
+
+class DependencyCycleError(Exception):
+    """Waiting on this story would make a story wait on itself, directly or through other stories."""
+
+
+class BlockersOpenError(Exception):
+    """The story waits on stories that are not done, so it can't enter WAITING_STATUSES yet."""
 
 
 class EvidenceFileTypeError(Exception):
@@ -189,6 +211,16 @@ class Board:
 
 
 @dataclass
+class StoryRef:
+    """Another story on the same board that a story waits on, or that waits on it."""
+
+    id: str
+    key: str
+    title: str
+    status: str
+
+
+@dataclass
 class StoredStory:
     id: str
     title: str
@@ -207,6 +239,8 @@ class StoredStory:
     parent_id: str | None = None
     parent_key: str | None = None
     tags: list[str] = field(default_factory=list)  # not in the fingerprint: the assessment doesn't read them
+    blocked_by: list[StoryRef] = field(default_factory=list)  # stories it waits on
+    blocks: list[StoryRef] = field(default_factory=list)  # stories that wait on it
 
     @property
     def key(self) -> str:
@@ -271,6 +305,16 @@ def story_fingerprint(
     if human_only:
         parts.append(_HUMAN_ONLY_MARK)
     return issue_fingerprint(title, "\n".join(parts))
+
+
+def blockers_open_message(story_key: str, open_keys: list[str]) -> str:
+    """Why a story can't enter In sprint or Done yet; the API and the MCP server both return it."""
+    one = len(open_keys) == 1
+    keys = open_keys[0] if one else f"{', '.join(open_keys[:-1])} and {open_keys[-1]}"
+    return (
+        f"{story_key} waits on {keys}, which {'is' if one else 'are'} not done yet. It can enter In sprint or Done "
+        f"once {'it is' if one else 'they are'}, or once the dependency is removed."
+    )
 
 
 def human_only_message(story_key: str) -> str:
@@ -342,6 +386,45 @@ def _story(row: sqlite3.Row) -> StoredStory:
         parent_key=f"{row['key_prefix']}-{row['parent_number']}" if row["parent_number"] is not None else None,
         tags=json.loads(row["tags"]),
     )
+
+
+def _attach_links(conn: sqlite3.Connection, board_id: str, stories: list[StoredStory]) -> None:
+    """Fill in blocked_by and blocks for *stories*, all on *board_id*, ordered by key number."""
+    by_id = {s.id: s for s in stories}
+    rows = conn.execute(
+        """
+        SELECT link.story_id, link.blocker_id, boards.key_prefix,
+               waiting.number AS waiting_number, waiting.title AS waiting_title, waiting.status AS waiting_status,
+               blocker.number AS blocker_number, blocker.title AS blocker_title, blocker.status AS blocker_status
+        FROM story_blockers AS link
+        JOIN stories AS waiting ON waiting.id = link.story_id
+        JOIN stories AS blocker ON blocker.id = link.blocker_id
+        JOIN boards ON boards.id = waiting.board_id
+        WHERE waiting.board_id = ?
+        ORDER BY blocker.number, waiting.number
+        """,
+        (board_id,),
+    )
+    for row in rows:
+        prefix = row["key_prefix"]
+        if (waiting := by_id.get(row["story_id"])) is not None:
+            waiting.blocked_by.append(
+                StoryRef(row["blocker_id"], f"{prefix}-{row['blocker_number']}", row["blocker_title"], row["blocker_status"])
+            )
+        if (blocker := by_id.get(row["blocker_id"])) is not None:
+            blocker.blocks.append(
+                StoryRef(row["story_id"], f"{prefix}-{row['waiting_number']}", row["waiting_title"], row["waiting_status"])
+            )
+
+
+def _read_story(conn: sqlite3.Connection, where: str, params: tuple) -> StoredStory | None:
+    """One story, with the stories it waits on and those waiting on it."""
+    row = conn.execute(f"{_SELECT_STORY} WHERE {where}", params).fetchone()
+    if row is None:
+        return None
+    story = _story(row)
+    _attach_links(conn, story.board_id, [story])
+    return story
 
 
 def _refuse_agent(actor: Actor, row: sqlite3.Row) -> None:
@@ -732,14 +815,12 @@ def set_human_only(story_id: str, human_only: bool, actor: Actor = BOARD_USER) -
                 action="story_human_only",
                 detail={"human_only": human_only},
             )
-            row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
-    return _story(row)
+        return _read_story(conn, "stories.id = ?", (story_id,))
 
 
 def get_story(story_id: str) -> StoredStory | None:
     with _connect() as conn:
-        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
-    return _story(row) if row else None
+        return _read_story(conn, "stories.id = ?", (story_id,))
 
 
 def get_story_by_key(key: str) -> StoredStory | None:
@@ -753,14 +834,7 @@ def get_story_by_key(key: str) -> StoredStory | None:
     except ValueError:
         return None
     with _connect() as conn:
-        row = conn.execute(
-            f"""
-            {_SELECT_STORY}
-            WHERE boards.key_prefix = ? AND stories.number = ?
-            """,
-            (prefix.upper(), number),
-        ).fetchone()
-    return _story(row) if row else None
+        return _read_story(conn, "boards.key_prefix = ? AND stories.number = ?", (prefix.upper(), number))
 
 
 def list_stories(board_id: str) -> list[tuple[StoredStory, list[Assessment]]]:
@@ -772,6 +846,7 @@ def list_stories(board_id: str) -> list[tuple[StoredStory, list[Assessment]]]:
                 f"{_SELECT_STORY} WHERE stories.board_id = ? ORDER BY stories.position, stories.created_at", (board_id,)
             )
         ]
+        _attach_links(conn, board_id, stories)
         rows = conn.execute(
             """
             SELECT story_id, verdict, quality, question_count, fingerprint, created_at FROM (
@@ -871,7 +946,6 @@ def update_story(
         )
         if cur.rowcount == 0:
             return None
-        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
         if changed:  # saving unchanged text is not an edit worth logging
             _log_activity(
                 conn,
@@ -882,7 +956,7 @@ def update_story(
                 action="story_edited",
                 detail={"fields": changed},
             )
-    return _story(row)
+        return _read_story(conn, "stories.id = ?", (story_id,))
 
 
 def move_story(
@@ -900,6 +974,8 @@ def move_story(
 
     A story whose latest verdict is in REFINING_VERDICTS, even a stale one, may only move into REFINING_STATUSES or
     within its current column. Raises ReadinessError.
+
+    A story may only enter WAITING_STATUSES once every story it waits on is done. Raises BlockersOpenError.
 
     Entering the done column needs *done_evidence* (DoneEvidenceIn as a dict); moving within it does not, and no
     other move takes it. Its uploaded files must belong to the story and not be used yet. They are marked attached,
@@ -928,6 +1004,19 @@ def move_story(
                     f"{story_key} has a {REFINING_VERDICTS[latest['verdict']]} verdict, so it can only move to Backlog "
                     "or Refinement. Assess it again once it is refined."
                 )
+        if status != old_status and status in WAITING_STATUSES:
+            open_keys = [
+                f"{old_row['key_prefix']}-{r['number']}"
+                for r in conn.execute(
+                    """
+                    SELECT blocker.number FROM story_blockers AS link JOIN stories AS blocker ON blocker.id = link.blocker_id
+                    WHERE link.story_id = ? AND blocker.status != 'done' ORDER BY blocker.number
+                    """,
+                    (story_id,),
+                )
+            ]
+            if open_keys:
+                raise BlockersOpenError(blockers_open_message(story_key, open_keys))
         entering_done = status == "done" and old_status != "done"
         if entering_done and done_evidence is None:
             raise EvidenceError(
@@ -943,7 +1032,6 @@ def move_story(
         )
         if cur.rowcount == 0:
             return None
-        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
         detail: dict = {"from": old_status, "to": status}
         if reason:
             detail["blocked_reason"] = reason
@@ -958,7 +1046,88 @@ def move_story(
             action="story_moved",
             detail=detail,
         )
-    return _story(row)
+        return _read_story(conn, "stories.id = ?", (story_id,))
+
+
+def add_blocker(story_id: str, blocker_id: str, actor: Actor = BOARD_USER) -> StoredStory | None:
+    """Make a story wait on another story on its board: it can't enter WAITING_STATUSES until that one is done.
+
+    Adding a link that exists already changes nothing and is not logged. Does not touch updated_at or the fingerprint.
+    Returns None if the story does not exist. Raises BlockerNotFoundError if *blocker_id* is not on the same board,
+    DependencyCycleError if the story would wait on itself (directly or through other stories), and HumanOnlyError
+    if an agent changes a human-only story.
+    """
+    with _connect() as conn:
+        # Take the write lock before reading, so two adds can't close a cycle between them.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if row is None:
+            return None
+        _refuse_agent(actor, row)
+        story_key = f"{row['key_prefix']}-{row['number']}"
+        blocker = conn.execute(
+            "SELECT number FROM stories WHERE id = ? AND board_id = ?", (blocker_id, row["board_id"])
+        ).fetchone()
+        if blocker is None:
+            raise BlockerNotFoundError(blocker_id)
+        blocker_key = f"{row['key_prefix']}-{blocker['number']}"
+        if blocker_id == story_id:
+            raise DependencyCycleError(f"{story_key} can't wait on itself.")
+        # Follow what the blocker waits on, and what those wait on; reaching this story would close a cycle.
+        cycle = conn.execute(
+            """
+            WITH RECURSIVE upstream(id) AS (
+                SELECT ? UNION SELECT link.blocker_id FROM story_blockers AS link JOIN upstream ON link.story_id = upstream.id
+            )
+            SELECT 1 FROM upstream WHERE id = ?
+            """,
+            (blocker_id, story_id),
+        ).fetchone()
+        if cycle is not None:
+            raise DependencyCycleError(
+                f"{blocker_key} already waits on {story_key}, directly or through other stories, so {story_key} "
+                f"can't wait on {blocker_key}."
+            )
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO story_blockers (story_id, blocker_id, created_at) VALUES (?, ?, ?)",
+            (story_id, blocker_id, _now().isoformat()),
+        )
+        if cur.rowcount:
+            _log_activity(
+                conn,
+                board_id=row["board_id"],
+                story_id=story_id,
+                story_key=story_key,
+                actor=actor,
+                action="story_blocker_added",
+                detail={"blocker_key": blocker_key},
+            )
+        return _read_story(conn, "stories.id = ?", (story_id,))
+
+
+def remove_blocker(story_id: str, blocker_id: str, actor: Actor = BOARD_USER) -> StoredStory | None:
+    """Stop a story waiting on another. Removing a link that does not exist changes nothing and is not logged.
+
+    Returns None if the story does not exist. Raises HumanOnlyError if an agent changes a human-only story.
+    """
+    with _connect() as conn:
+        row = conn.execute(f"{_SELECT_STORY} WHERE stories.id = ?", (story_id,)).fetchone()
+        if row is None:
+            return None
+        _refuse_agent(actor, row)
+        blocker = conn.execute("SELECT number FROM stories WHERE id = ?", (blocker_id,)).fetchone()
+        cur = conn.execute("DELETE FROM story_blockers WHERE story_id = ? AND blocker_id = ?", (story_id, blocker_id))
+        if cur.rowcount:
+            _log_activity(
+                conn,
+                board_id=row["board_id"],
+                story_id=story_id,
+                story_key=f"{row['key_prefix']}-{row['number']}",
+                actor=actor,
+                action="story_blocker_removed",
+                detail={"blocker_key": f"{row['key_prefix']}-{blocker['number']}"},
+            )
+        return _read_story(conn, "stories.id = ?", (story_id,))
 
 
 def delete_story(story_id: str, actor: Actor = BOARD_USER) -> bool:

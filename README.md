@@ -66,7 +66,9 @@ PYTHONPATH=src uv run pytest -v
 | `GET` `POST` | `/api/boards/{id}/stories` | List a board's stored stories, or store a pasted story on it (at most 100 per board) |
 | `GET` `PUT` `DELETE` | `/api/stories/{id}` | Read (with latest report and history), edit or delete a stored story |
 | `PUT` | `/api/stories/{id}/human-only` | Set or clear a stored story's human-only tag (only people on the board; never agents) |
-| `PUT` | `/api/stories/{id}/move` | Move a stored story to a workflow column and position (board drag and drop); entering Done needs evidence |
+| `POST` | `/api/stories/{id}/blockers` | Make a stored story wait on another story on its board (`{"blocker_id": …}`); cycles are refused |
+| `DELETE` | `/api/stories/{id}/blockers/{blocker_id}` | Stop a stored story waiting on another story |
+| `PUT` | `/api/stories/{id}/move` | Move a stored story to a workflow column and position (board drag and drop); entering Done needs evidence, and entering In sprint or Done needs every story it waits on to be done |
 | `POST` | `/api/stories/{id}/evidence` | Upload a test report, screenshot or recording for a move to Done (multipart, at most 50 MB) |
 | `GET` `DELETE` | `/api/evidence/{file_id}` | Download an evidence file, or delete one no move has used yet |
 | `POST` | `/api/stories/{id}/assess` | Assess a stored story and save the report to its history |
@@ -182,14 +184,16 @@ Other MCP clients take the same command: `uv run --directory /abs/path/story-ref
 | Tool | What it does |
 |---|---|
 | `list_boards` | Boards with `story_count` and `story_limit` |
-| `list_stories(board, status?, tag?)` | A board's stories: key, title, column, verdict, quality, stale, blocked reason, agents, human_only, parent_key, tags |
+| `list_stories(board, status?, tag?)` | A board's stories: key, title, column, verdict, quality, stale, blocked reason, agents, human_only, parent_key, tags, blocked_by (keys it waits on that aren't done), blocks |
 | `get_story(story)` | Full text, the latest report (checks and questions for the author), assessment history and activity |
 | `get_activity(board, story?, limit?)` | The activity log, newest first |
 | `create_board(name, key_prefix, note, description?)` | New board |
 | `update_board(board, note, name?, description?)` | Rename a board or change its description |
 | `create_story(board, title, note, description?, acceptance_criteria?, definition_of_ready?, parent?, tags?)` | New story at the end of the backlog; `parent` splits it from a story on the same board (not a human-only one) |
 | `update_story(story, note, title?, description?, acceptance_criteria?, definition_of_ready?, tags?)` | Change only the given fields; `tags` replaces the whole list. A text change marks the story stale; a tags-only change doesn't |
-| `move_story(story, status, note, place?, blocked_reason?, done_evidence?)` | Move to the `top` or `bottom` (default) of a column; `blocked` needs a reason, entering `done` needs evidence |
+| `move_story(story, status, note, place?, blocked_reason?, done_evidence?)` | Move to the `top` or `bottom` (default) of a column; `blocked` needs a reason, entering `done` needs evidence, and entering `in_sprint` or `done` needs every story it waits on to be done |
+| `add_blocker(story, blocker, note)` | Make a story wait on another on the same board; cycles are refused |
+| `remove_blocker(story, blocker, note)` | Stop a story waiting on another |
 | `assess_story(story, note)` | Assess with Jev (one call) and save the report |
 
 - `board` is a board id or key prefix (`FLW`); `story` is a story id or key (`FLW-12`).

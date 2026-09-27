@@ -725,12 +725,95 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/stories/{story_id}/blockers:
+    post:
+      tags:
+      - stories
+      summary: Make a stored story wait on another story on its board
+      description: The story can't enter in_sprint or done until the story it waits on is done; it can still move
+        anywhere else. Both stories must be on the same board, and a story can't wait on itself, directly or through
+        other stories. A story not on the board is a 422 with loc ["body", "blocker_id"] and type blocker_invalid;
+        a cycle is a 422 with type dependency_cycle. Adding a dependency that exists already changes nothing. Does
+        not mark the story stale. The change is logged as story_blocker_added.
+      operationId: addStoryBlocker
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BlockerIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredStoryOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/stories/{story_id}/blockers/{blocker_id}:
+    delete:
+      tags:
+      - stories
+      summary: Stop a stored story waiting on another story
+      description: Removing a dependency that does not exist changes nothing. The change is logged as
+        story_blocker_removed.
+      operationId: removeStoryBlocker
+      parameters:
+      - name: story_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Story Id
+      - name: blocker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Blocker Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredStoryOut'
+        '404':
+          description: The story was not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/stories/{story_id}/move:
     put:
       tags:
       - stories
       summary: Move a stored story to a workflow column and position
-      description: Used by drag and drop on the board. Does not change the story's text or mark it stale. Moving to the blocked column requires a blocked_reason; moving anywhere else clears it. Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); it is recorded in the story's activity. Missing or unusable evidence is a 422 with loc ["body", "done_evidence"]. While the latest assessment's verdict is discuss or needs_refinement (even if stale), the story can only move to backlog or refinement, or within its current column, until it is assessed again; any other column is a 422 with loc ["body", "status"] and type status_not_allowed.
+      description: Used by drag and drop on the board. Does not change the story's text or mark it stale. Moving to the blocked column requires a blocked_reason; moving anywhere else clears it. Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); it is recorded in the story's activity. Missing or unusable evidence is a 422 with loc ["body", "done_evidence"]. While the latest assessment's verdict is discuss or needs_refinement (even if stale), the story can only move to backlog or refinement, or within its current column, until it is assessed again; any other column is a 422 with loc ["body", "status"] and type status_not_allowed. A story can't enter in_sprint or done while a story it waits on (blocked_by) is not done; that is a 422 with loc ["body", "status"] and type blockers_open.
       operationId: moveStory
       parameters:
       - name: story_id
@@ -873,12 +956,14 @@ components:
           - story_assessed
           - story_deleted
           - story_human_only
+          - story_blocker_added
+          - story_blocker_removed
           title: Action
         detail:
           type: object
           additionalProperties: true
           title: Detail
-          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}. A move into done has an "evidence" object with test_reports, ui_change, ui_evidence and commits; each uploaded file's id, filename, content_type and size are under "file". A split story's story_created has "parent_key"; a story created with tags has "tags"; story_edited's "fields" can include "tags". story_human_only has {"human_only":true|false}, and "inherited_from" (the parent's key) when a split story inherited the tag.
+          description: Action-specific data, e.g. {"fields":["title"]} or {"from":"backlog","to":"blocked"}. A move into done has an "evidence" object with test_reports, ui_change, ui_evidence and commits; each uploaded file's id, filename, content_type and size are under "file". A split story's story_created has "parent_key"; a story created with tags has "tags"; story_edited's "fields" can include "tags". story_human_only has {"human_only":true|false}, and "inherited_from" (the parent's key) when a split story inherited the tag. story_blocker_added and story_blocker_removed have "blocker_key", the key of the story it waits on.
         note:
           anyOf:
           - type: string
@@ -1068,6 +1153,19 @@ components:
       required:
       - name
       title: BoardUpdateIn
+    BlockerIn:
+      properties:
+        blocker_id:
+          type: string
+          maxLength: 64
+          minLength: 1
+          title: Blocker Id
+          description: ID of the story on the same board to wait on. The story can't enter in_sprint or done until
+            that one is done.
+      type: object
+      required:
+      - blocker_id
+      title: BlockerIn
     CheckOut:
       properties:
         id:
@@ -1545,6 +1643,18 @@ components:
           - type: 'null'
           title: Parent Key
           description: Key of the story it was split from, e.g. FLW-3, or null.
+        blocked_by:
+          items:
+            $ref: '#/components/schemas/StoryRefOut'
+          type: array
+          title: Blocked By
+          description: Stories on the board it waits on. It can't enter in_sprint or done until they are all done.
+        blocks:
+          items:
+            $ref: '#/components/schemas/StoryRefOut'
+          type: array
+          title: Blocks
+          description: Stories on the board that wait on it.
         tags:
           items:
             type: string
@@ -1591,6 +1701,8 @@ components:
       - parent_id
       - parent_key
       - tags
+      - blocked_by
+      - blocks
       - report
       - history
       - activity
@@ -1688,6 +1800,18 @@ components:
           - type: 'null'
           title: Parent Key
           description: Key of the story it was split from, e.g. FLW-3, or null.
+        blocked_by:
+          items:
+            $ref: '#/components/schemas/StoryRefOut'
+          type: array
+          title: Blocked By
+          description: Stories on the board it waits on. It can't enter in_sprint or done until they are all done.
+        blocks:
+          items:
+            $ref: '#/components/schemas/StoryRefOut'
+          type: array
+          title: Blocks
+          description: Stories on the board that wait on it.
         tags:
           items:
             type: string
@@ -1716,6 +1840,8 @@ components:
       - parent_id
       - parent_key
       - tags
+      - blocked_by
+      - blocks
       title: StoredStoryOut
     StoryCreateIn:
       properties:
@@ -1894,6 +2020,37 @@ components:
       - url
       title: StoryOut
       description: The story as judged, after acceptance criteria were split out of the description.
+    StoryRefOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        key:
+          type: string
+          title: Key
+          description: Human-readable key, e.g. FLW-3.
+        title:
+          type: string
+          title: Title
+        status:
+          type: string
+          enum:
+          - backlog
+          - refinement
+          - ready_for_sprint
+          - in_sprint
+          - done
+          - blocked
+          title: Status
+          description: Its workflow column; done lifts the dependency.
+      type: object
+      required:
+      - id
+      - key
+      - title
+      - status
+      title: StoryRefOut
+      description: Another story on the same board, in a dependency.
     StoryType:
       properties:
         choice:

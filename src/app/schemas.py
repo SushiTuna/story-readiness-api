@@ -245,6 +245,15 @@ class HumanOnlyIn(BaseModel):
     )
 
 
+class BlockerIn(BaseModel):
+    blocker_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description="ID of the story on the same board to wait on. The story can't enter in_sprint or done until that "
+        "one is done.",
+    )
+
+
 class EvidenceItemIn(BaseModel):
     """One piece of evidence: a file uploaded with POST /stories/{story_id}/evidence, or a link."""
 
@@ -358,6 +367,8 @@ class ActivityOut(BaseModel):
         "story_assessed",
         "story_deleted",
         "story_human_only",
+        "story_blocker_added",
+        "story_blocker_removed",
     ]
     detail: dict = Field(
         description="Action-specific data, e.g. {\"fields\": [\"title\"]} or {\"from\": \"backlog\", \"to\": \"blocked\"}. "
@@ -365,11 +376,23 @@ class ActivityOut(BaseModel):
         "uploaded file's id, filename, content_type and size under \"file\". A split story's story_created has "
         "\"parent_key\"; a story created with tags has \"tags\"; story_edited's \"fields\" can include \"tags\". "
         "story_human_only has {\"human_only\": true|false}, and \"inherited_from\" (the parent's key) when a split "
-        "story inherited the tag."
+        "story inherited the tag. story_blocker_added and story_blocker_removed have \"blocker_key\", the key of the "
+        "story it waits on."
     )
     note: str | None = Field(description="The agent's reason for the change, or null for UI changes.")
     story_key: str | None = Field(description="Human-readable story key, kept after the story is deleted.")
     created_at: datetime
+
+
+class StoryRefOut(BaseModel):
+    """Another story on the same board, in a dependency."""
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    id: str
+    key: str
+    title: str
+    status: StoryStatus
 
 
 class StoredStoryOut(BaseModel):
@@ -401,12 +424,49 @@ class StoredStoryOut(BaseModel):
     )
     parent_id: str | None = Field(description="ID of the story it was split from, or null.")
     parent_key: str | None = Field(description="Key of the story it was split from, e.g. FLW-3, or null.")
+    blocked_by: list[StoryRefOut] = Field(
+        default_factory=list,
+        description="Stories on the board it waits on. It can't enter in_sprint or done until they are all done.",
+    )
+    blocks: list[StoryRefOut] = Field(default_factory=list, description="Stories on the board that wait on it.")
 
 
 class StoredStoryDetailOut(StoredStoryOut):
     report: ReportOut | None = Field(description="Full report of the latest assessment.")
     history: list[AssessmentSummaryOut] = Field(description="All assessments, newest first.")
     activity: list[ActivityOut] = Field(default_factory=list, description="Activity log for this story, newest first.")
+
+
+class CompactCheckOut(BaseModel):
+    id: str
+    label: str
+    passed: bool
+    unsure: bool
+    ask: list[str] = Field(description="Questions for the author.")
+
+
+class CompactReportOut(BaseModel):
+    """The latest report without the echoed story text or Jev call metadata. MCP only."""
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    verdict: VerdictEnum
+    quality: float = Field(ge=0.0, le=1.0)
+    story_type: StoryType
+    blockers_failed: list[str]
+    to_discuss: list[str]
+    agent_checks_skipped: bool
+    checks: list[CompactCheckOut | CheckOut] = Field(
+        description="Failed or unsure checks only, unless full_report was asked for; then all checks in full."
+    )
+
+
+class StoryDetailMcpOut(StoredStoryOut):
+    report: CompactReportOut | None = Field(description="Latest assessment report, or null if never assessed.")
+    history: list[AssessmentSummaryOut] = Field(description="Most recent assessments, newest first.")
+    history_total: int = Field(description="Number of assessments in all, including those left out of `history`.")
+    activity: list[ActivityOut] = Field(description="Most recent activity for this story, newest first.")
+    activity_more: bool = Field(description="Older activity was left out; use get_activity to read it.")
 
 
 # ---------------------------------------------------------------------------

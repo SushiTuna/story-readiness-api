@@ -57,6 +57,18 @@ def parent_invalid(message: str) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": [error]})
 
 
+def blockers_open(message: str) -> JSONResponse:
+    """422 for a move into in_sprint or done while the story waits on stories that are not done."""
+    error = {"loc": ["body", "status"], "msg": message, "type": "blockers_open"}
+    return JSONResponse(status_code=422, content={"detail": [error]})
+
+
+def blocker_invalid(message: str, type_: str = "blocker_invalid") -> JSONResponse:
+    """422 for a story to wait on that is not on the board (blocker_invalid), or that closes a cycle (dependency_cycle)."""
+    error = {"loc": ["body", "blocker_id"], "msg": message, "type": type_}
+    return JSONResponse(status_code=422, content={"detail": [error]})
+
+
 def evidence_not_found() -> JSONResponse:
     return _error(404, "The evidence file was not found.")
 

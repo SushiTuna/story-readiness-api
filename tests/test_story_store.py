@@ -856,3 +856,134 @@ def test_agents_can_tag_stories_but_not_human_only_ones():
     with pytest.raises(story_store.HumanOnlyError):
         story_store.update_story(locked.id, **_STORY, tags=["backend"], actor=_BOT)
     assert story_store.get_story(locked.id).tags == []
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+
+def _refs(refs: list[story_store.StoryRef]) -> list[tuple[str, str]]:
+    return [(r.key, r.status) for r in refs]
+
+
+def test_add_blocker_links_both_stories_and_logs_it_once():
+    api = _create(title="Orders API")
+    ui = _create(title="Orders page")
+
+    story = story_store.add_blocker(ui.id, api.id)
+    story_store.add_blocker(ui.id, api.id)  # already there: not logged again
+
+    assert _refs(story.blocked_by) == [("ST-1", "backlog")]
+    assert story.blocked_by[0].title == "Orders API"
+    assert _refs(story_store.get_story(api.id).blocks) == [("ST-2", "backlog")]
+    assert _refs(story_store.get_story_by_key("ST-2").blocked_by) == [("ST-1", "backlog")]
+    listed = {s.key: s for s, _ in story_store.list_stories(_st_board().id)}
+    assert (_refs(listed["ST-2"].blocked_by), _refs(listed["ST-1"].blocks)) == ([("ST-1", "backlog")], [("ST-2", "backlog")])
+    assert [a for _, _, a, _ in _story_log(ui.id)].count("story_blocker_added") == 1
+    assert _story_log(ui.id)[-1] == ("user", "board", "story_blocker_added", {"blocker_key": "ST-1"})
+    # Not an edit: the text and its assessment are untouched.
+    assert story_store.get_story(ui.id).updated_at == ui.updated_at
+
+
+def test_a_waiting_story_cannot_enter_in_sprint_or_done_until_its_blockers_are_done():
+    api = _create(title="Orders API")
+    db = _create(title="Orders table")
+    ui = _create(title="Orders page")
+    story_store.add_blocker(ui.id, db.id)
+    story_store.add_blocker(ui.id, api.id)
+
+    for status in ("in_sprint", "done"):
+        with pytest.raises(
+            story_store.BlockersOpenError,
+            match=r"^ST-3 waits on ST-1 and ST-2, which are not done yet\. It can enter In sprint or Done once they are",
+        ):
+            story_store.move_story(ui.id, status=status, position=1, done_evidence=_evidence() if status == "done" else None)
+    # It can still be planned, refined or parked.
+    for status in ("refinement", "ready_for_sprint", "blocked", "backlog"):
+        assert story_store.move_story(ui.id, status=status, position=1, blocked_reason="x").status == status
+
+    story_store.move_story(api.id, status="done", position=1, done_evidence=_evidence())
+    with pytest.raises(story_store.BlockersOpenError, match=r"^ST-3 waits on ST-2, which is not done yet\. .* once it is"):
+        story_store.move_story(ui.id, status="in_sprint", position=1)
+    story_store.move_story(db.id, status="done", position=2, done_evidence=_evidence())
+    assert story_store.move_story(ui.id, status="in_sprint", position=1).status == "in_sprint"
+    assert _refs(story_store.get_story(ui.id).blocked_by) == [("ST-1", "done"), ("ST-2", "done")]
+
+
+def test_a_story_already_in_sprint_can_be_reordered_but_not_finished_while_it_waits():
+    api = _create()
+    ui = _create()
+    story_store.move_story(ui.id, status="in_sprint", position=1)
+    story_store.add_blocker(ui.id, api.id)  # recorded even though ST-2 is already in the sprint
+
+    assert story_store.move_story(ui.id, status="in_sprint", position=0.5).position == 0.5
+    with pytest.raises(story_store.BlockersOpenError):
+        story_store.move_story(ui.id, status="done", position=1, done_evidence=_evidence())
+    assert story_store.get_story(ui.id).status == "in_sprint"
+
+
+def test_a_story_cannot_wait_on_itself_directly_or_through_others():
+    a, b, c = _create(), _create(), _create()
+    with pytest.raises(story_store.DependencyCycleError, match="^ST-1 can't wait on itself"):
+        story_store.add_blocker(a.id, a.id)
+    story_store.add_blocker(b.id, a.id)  # ST-2 waits on ST-1
+    story_store.add_blocker(c.id, b.id)  # ST-3 waits on ST-2
+    with pytest.raises(story_store.DependencyCycleError, match="^ST-2 already waits on ST-1"):
+        story_store.add_blocker(a.id, b.id)
+    with pytest.raises(story_store.DependencyCycleError, match="^ST-3 already waits on ST-1, directly or through"):
+        story_store.add_blocker(a.id, c.id)
+    assert story_store.get_story(a.id).blocked_by == []
+    # A diamond is not a cycle.
+    story_store.add_blocker(c.id, a.id)
+    assert _refs(story_store.get_story(c.id).blocked_by) == [("ST-1", "backlog"), ("ST-2", "backlog")]
+
+
+def test_a_blocker_must_be_on_the_same_board():
+    other = story_store.create_board(name="Other", key_prefix="OT")
+    elsewhere = _create(other.id)
+    story = _create()
+    with pytest.raises(story_store.BlockerNotFoundError):
+        story_store.add_blocker(story.id, elsewhere.id)
+    with pytest.raises(story_store.BlockerNotFoundError):
+        story_store.add_blocker(story.id, "nope")
+    assert story_store.add_blocker("nope", story.id) is None
+
+
+def test_remove_blocker_logs_it_and_skips_no_ops():
+    api, ui = _create(), _create()
+    story_store.add_blocker(ui.id, api.id)
+
+    story = story_store.remove_blocker(ui.id, api.id)
+    story_store.remove_blocker(ui.id, api.id)  # already gone: not logged
+
+    assert story.blocked_by == [] and story_store.get_story(api.id).blocks == []
+    assert [a for _, _, a, _ in _story_log(ui.id)] == ["story_created", "story_blocker_added", "story_blocker_removed"]
+    assert _story_log(ui.id)[-1][3] == {"blocker_key": "ST-1"}
+    assert story_store.move_story(ui.id, status="in_sprint", position=1).status == "in_sprint"
+    assert story_store.remove_blocker("nope", api.id) is None
+
+
+def test_deleting_a_blocker_lifts_the_dependency():
+    api, ui = _create(), _create()
+    story_store.add_blocker(ui.id, api.id)
+    story_store.delete_story(api.id)
+    assert story_store.get_story(ui.id).blocked_by == []
+    assert story_store.move_story(ui.id, status="in_sprint", position=1).status == "in_sprint"
+
+
+def test_agents_manage_dependencies_except_on_human_only_stories():
+    api, ui = _create(), _create()
+    tagged = _create(human_only=True)
+    creds = _create()
+
+    assert _refs(story_store.add_blocker(ui.id, api.id, actor=_BOT).blocked_by) == [("ST-1", "backlog")]
+    assert _story_log(ui.id)[-1] == ("agent", "planner-bot", "story_blocker_added", {"blocker_key": "ST-1"})
+    # Waiting on a human-only story changes only the waiting one.
+    story_store.add_blocker(api.id, tagged.id, actor=_BOT)
+    with pytest.raises(story_store.HumanOnlyError, match="^ST-3 is human-only"):
+        story_store.add_blocker(tagged.id, creds.id, actor=_BOT)
+    story_store.add_blocker(tagged.id, creds.id)  # someone on the board can
+    with pytest.raises(story_store.HumanOnlyError):
+        story_store.remove_blocker(tagged.id, creds.id, actor=_BOT)
+    assert _refs(story_store.get_story(tagged.id).blocked_by) == [("ST-4", "backlog")]

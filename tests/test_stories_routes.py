@@ -499,3 +499,57 @@ async def test_changing_only_tags_keeps_the_verdict_current(client, monkeypatch)
     detail = (await client.get(f"/api/stories/{story['id']}")).json()
     assert detail["activity"][0]["action"] == "story_edited"
     assert detail["activity"][0]["detail"] == {"fields": ["tags"]}
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+
+async def test_add_and_remove_a_blocker(client):
+    api = await _create(client, title="Orders API")
+    ui = await _create(client, title="Orders page")
+    assert (ui["blocked_by"], ui["blocks"]) == ([], [])
+
+    resp = await client.post(f"/api/stories/{ui['id']}/blockers", json={"blocker_id": api["id"]})
+    assert resp.status_code == 200
+    assert resp.json()["blocked_by"] == [{"id": api["id"], "key": "ST-1", "title": "Orders API", "status": "backlog"}]
+    [listed_api, listed_ui] = (await client.get(_stories_url())).json()
+    assert [r["key"] for r in listed_api["blocks"]] == ["ST-2"]
+    assert [r["key"] for r in listed_ui["blocked_by"]] == ["ST-1"]
+    detail = (await client.get(f"/api/stories/{ui['id']}")).json()
+    assert detail["activity"][0]["action"] == "story_blocker_added"
+    assert detail["activity"][0]["detail"] == {"blocker_key": "ST-1"}
+
+    move = await client.put(f"/api/stories/{ui['id']}/move", json={"status": "in_sprint", "position": 1})
+    assert move.status_code == 422
+    [error] = move.json()["detail"]
+    assert (error["loc"], error["type"]) == (["body", "status"], "blockers_open")
+    assert error["msg"].startswith("ST-2 waits on ST-1, which is not done yet.")
+
+    resp = await client.delete(f"/api/stories/{ui['id']}/blockers/{api['id']}")
+    assert resp.status_code == 200
+    assert resp.json()["blocked_by"] == []
+    move = await client.put(f"/api/stories/{ui['id']}/move", json={"status": "in_sprint", "position": 1})
+    assert move.status_code == 200
+
+
+async def test_blocker_errors(client):
+    a = await _create(client)
+    b = await _create(client)
+    blockers = f"/api/stories/{a['id']}/blockers"
+
+    for body, kind in (({"blocker_id": "nope"}, "blocker_invalid"), ({"blocker_id": a["id"]}, "dependency_cycle")):
+        resp = await client.post(blockers, json=body)
+        assert resp.status_code == 422
+        [error] = resp.json()["detail"]
+        assert (error["loc"], error["type"]) == (["body", "blocker_id"], kind)
+
+    await client.post(f"/api/stories/{b['id']}/blockers", json={"blocker_id": a["id"]})
+    resp = await client.post(blockers, json={"blocker_id": b["id"]})
+    assert resp.json()["detail"][0]["msg"] == (
+        "ST-2 already waits on ST-1, directly or through other stories, so ST-1 can't wait on ST-2."
+    )
+    assert (await client.post(blockers, json={"blocker_id": ""})).status_code == 422
+    assert (await client.post("/api/stories/nope/blockers", json={"blocker_id": a["id"]})).status_code == 404
+    assert (await client.delete(f"/api/stories/nope/blockers/{a['id']}")).status_code == 404

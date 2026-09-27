@@ -12,6 +12,7 @@ from app import story_store
 from app.mcp_server import _server
 from app.schemas import VerdictEnum
 from tests.test_routes import _make_report
+from tests.test_story_store import _report
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +52,10 @@ def _mock_assess(monkeypatch, quality: float) -> None:
 async def test_notes_are_required_in_the_tool_schemas():
     async with Client(_server) as client:
         tools = {t.name: t for t in (await client.list_tools()).tools}
-        writes = {"create_board", "update_board", "create_story", "update_story", "move_story", "assess_story"}
+        writes = {
+            "create_board", "update_board", "create_story", "update_story", "move_story", "assess_story",
+            "add_blocker", "remove_blocker",
+        }
         for name in writes:
             assert "note" in tools[name].input_schema["required"], name
             assert tools[name].annotations.read_only_hint is False
@@ -326,3 +330,76 @@ async def test_agents_set_tags_and_filter_by_them():
     assert (detail["activity"][0]["action"], detail["activity"][0]["detail"], detail["activity"][0]["note"]) == (
         "story_edited", {"fields": ["tags"]}, "It is UI work"
     )
+
+
+async def test_get_story_is_compact_and_capped(monkeypatch):
+    async with Client(_server) as client:
+        await _call(client, "create_board", name="Flowershop", key_prefix="FLW", note="New goal")
+        await _call(client, "create_story", board="FLW", title="Checkout", note="From the brief")
+        story = story_store.get_story_by_key("FLW-1")
+        for quality in (0.5, 0.6, 0.7):
+            story_store.add_assessment(story_store.get_story(story.id), _report(quality, failing_asks=["Which codes?"]))
+        for n in range(3):
+            await _call(client, "update_story", story="FLW-1", title=f"Checkout {n}", note="Clearer")
+
+        detail = await _call(client, "get_story", story="FLW-1", history_limit=2, activity_limit=2)
+        full = await _call(client, "get_story", story="FLW-1", full_report=True)
+
+    assert [h["quality"] for h in detail["history"]] == [0.7, 0.6] and detail["history_total"] == 3
+    assert len(detail["activity"]) == 2 and detail["activity_more"] is True
+    assert "story" not in detail["report"] and "model" not in detail["report"]
+    assert detail["report"]["checks"] == [
+        {"id": "failure_handling", "label": "Failure handling", "passed": False, "unsure": False, "ask": ["Which codes?"]}
+    ]
+    assert [c["id"] for c in full["report"]["checks"]] == ["ac_present", "failure_handling"]
+    assert full["report"]["checks"][0]["answer"] == {"present": 1}
+    assert full["activity_more"] is False and full["history_total"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+async def test_agents_add_and_remove_blockers_and_moves_respect_them():
+    async with Client(_server) as client:
+        await _call(client, "create_board", name="Flowershop", key_prefix="FLW", note="New goal")
+        await _call(client, "create_story", board="FLW", title="Orders API", note="From the brief")
+        await _call(client, "create_story", board="FLW", title="Orders page", note="From the brief")
+
+        added = await _call(client, "add_blocker", story="FLW-2", blocker="FLW-1", note="The page calls the API")
+        assert [(r["key"], r["status"]) for r in added["blocked_by"]] == [("FLW-1", "backlog")]
+        listed = {s["key"]: s for s in (await _call(client, "list_stories", board="FLW"))["result"]}
+        assert (listed["FLW-2"]["blocked_by"], listed["FLW-1"]["blocks"]) == (["FLW-1"], ["FLW-2"])
+
+        error = await _error(client, "move_story", story="FLW-2", status="in_sprint", note="Start it")
+        assert "FLW-2 waits on FLW-1, which is not done yet." in error
+        error = await _error(client, "add_blocker", story="FLW-1", blocker="FLW-2", note="Loop")
+        assert "FLW-2 already waits on FLW-1" in error
+
+        await _call(client, "move_story", story="FLW-1", status="done", done_evidence=_EVIDENCE, note="Shipped")
+        # A finished blocker no longer shows in the compact list.
+        listed = {s["key"]: s for s in (await _call(client, "list_stories", board="FLW"))["result"]}
+        assert listed["FLW-2"]["blocked_by"] == []
+        moved = await _call(client, "move_story", story="FLW-2", status="in_sprint", note="Unblocked")
+        assert moved["status"] == "in_sprint"
+
+        removed = await _call(client, "remove_blocker", story="FLW-2", blocker="FLW-1", note="Not needed")
+        assert removed["blocked_by"] == []
+        activity = await _call(client, "get_activity", board="FLW", story="FLW-2")
+        assert [(a["action"], a["note"]) for a in activity["result"]][:1] == [("story_blocker_removed", "Not needed")]
+
+
+async def test_agents_cannot_change_dependencies_of_a_human_only_story():
+    story = _human_only_story()
+    other = story_store.create_story(
+        story.board_id, title="Other", description="", acceptance_criteria="", definition_of_ready=[]
+    )
+    async with Client(_server) as client:
+        for tool in ("add_blocker", "remove_blocker"):
+            error = await _error(client, tool, story="SHP-1", blocker="SHP-2", note="Try")
+            assert "SHP-1 is human-only" in error
+        # The other way round only changes SHP-2.
+        added = await _call(client, "add_blocker", story="SHP-2", blocker="SHP-1", note="Needs the creds first")
+        assert [r["key"] for r in added["blocked_by"]] == ["SHP-1"]
+    assert story_store.get_story(story.id).blocked_by == []
+    assert other.key == "SHP-2"

@@ -39,8 +39,11 @@ from app.schemas import (
     BoardUpdateIn,
     CommitIn,
     DoneEvidenceIn,
-    StoredStoryDetailOut,
+    CompactCheckOut,
+    CompactReportOut,
+    ReportOut,
     StoredStoryOut,
+    StoryDetailMcpOut,
     StoryIn,
     StoryMoveIn,
 )
@@ -74,6 +77,9 @@ Rules:
 - Stories can have up to 10 tags for the kind of work, e.g. backend, frontend, design, platform, security.
   Tags are lowercase letters, digits and hyphens. Reuse the tags already on the board where they fit.
   Changing only the tags doesn't make the assessment stale.
+- A story can wait on other stories on its board (blocked_by). It can't move INTO "in_sprint" or "done"
+  until every story it waits on is done; it can still move anywhere else. Pick up the stories it waits on
+  first. Use add_blocker when one story needs another finished first, and remove_blocker when it no longer does.
 - Stories have a human-readable key like FLW-12. You can use keys or IDs in all tools.
 - Boards are identified by ID or key prefix (e.g. "FLW").
 
@@ -164,14 +170,37 @@ def _out(story: story_store.StoredStory) -> StoredStoryOut:
     return StoredStoryOut(**_fields(story, recent, _agents(story)))
 
 
-def _detail(story: story_store.StoredStory) -> StoredStoryDetailOut:
+def _compact_report(report: ReportOut, full: bool) -> CompactReportOut:
+    checks = report.checks if full else [
+        CompactCheckOut(id=c.id, label=c.label, passed=c.passed, unsure=c.unsure, ask=c.ask)
+        for c in report.checks
+        if not c.passed or c.unsure
+    ]
+    return CompactReportOut(
+        verdict=report.verdict,
+        quality=report.quality,
+        story_type=report.story_type,
+        blockers_failed=report.blockers_failed,
+        to_discuss=report.to_discuss,
+        agent_checks_skipped=report.agent_checks_skipped,
+        checks=checks,
+    )
+
+
+def _detail(
+    story: story_store.StoredStory, history_limit: int = 5, activity_limit: int = 10, full_report: bool = False
+) -> StoryDetailMcpOut:
     history = story_store.list_assessments(story.id)
-    activity = story_store.list_activity(story.board_id, story_id=story.id)
-    return StoredStoryDetailOut(
+    # One extra entry tells us whether older activity was left out.
+    activity = story_store.list_activity(story.board_id, story_id=story.id, limit=activity_limit + 1)
+    report = history[0].report() if history else None
+    return StoryDetailMcpOut(
         **_fields(story, history, _agents(story)),
-        report=history[0].report() if history else None,
-        history=[_summary(a) for a in history],
-        activity=[_activity_out(e) for e in activity],
+        report=_compact_report(report, full_report) if report else None,
+        history=[_summary(a) for a in history[:history_limit]],
+        history_total=len(history),
+        activity=[_activity_out(e) for e in activity[:activity_limit]],
+        activity_more=len(activity) > activity_limit,
     )
 
 
@@ -188,7 +217,8 @@ def list_boards() -> list[BoardOut]:
     annotations=_READ_ONLY,
     description=(
         "List stories on a board. Returns a compact view: key, title, status, verdict, quality, "
-        "stale, blocked_reason, agents, human_only, parent_key, tags. Human-only stories can be read but not changed. "
+        "stale, blocked_reason, agents, human_only, parent_key, tags, blocked_by (keys of stories it waits on that "
+        "are not done yet) and blocks (keys of stories waiting on it). Human-only stories can be read but not changed. "
         "board: board ID or key prefix (e.g. 'FLW'). "
         "status: optional filter, one of backlog/refinement/ready_for_sprint/in_sprint/done/blocked. "
         "tag: optional filter, only stories with this tag (e.g. 'backend')."
@@ -219,6 +249,8 @@ def list_stories(board: str, status: Status | None = None, tag: str | None = Non
             "human_only": story.human_only,
             "parent_key": story.parent_key,
             "tags": story.tags,
+            "blocked_by": [r.key for r in story.blocked_by if r.status != "done"],
+            "blocks": [r.key for r in story.blocks],
         })
     return result
 
@@ -226,13 +258,21 @@ def list_stories(board: str, status: Status | None = None, tag: str | None = Non
 @_server.tool(
     annotations=_READ_ONLY,
     description=(
-        "Get the full details of a story: text, latest assessment report (checks and questions for "
-        "the author), assessment history, and activity log. "
-        "story: story ID or key (e.g. 'FLW-12')."
+        "Get a story: text, latest assessment report (failed or unsure checks with questions for the author), "
+        "recent assessment history and recent activity. "
+        "story: story ID or key (e.g. 'FLW-12'). "
+        "history_limit: max assessments to return (default 5); history_total gives the full count. "
+        "activity_limit: max activity entries to return (default 10); use get_activity for the full log. "
+        "full_report: true to return every check in full, including passed ones."
     ),
 )
-def get_story(story: str) -> StoredStoryDetailOut:
-    return _detail(_resolve_story(story))
+def get_story(
+    story: str,
+    history_limit: Annotated[int, Field(ge=0, le=100)] = 5,
+    activity_limit: Annotated[int, Field(ge=0, le=100)] = 10,
+    full_report: bool = False,
+) -> StoryDetailMcpOut:
+    return _detail(_resolve_story(story), history_limit, activity_limit, full_report)
 
 
 @_server.tool(
@@ -454,6 +494,59 @@ def update_story(
     return _out(updated)
 
 
+@_server.tool(
+    annotations=_WRITE_IDEMPOTENT,
+    description=(
+        "Make a story wait on another story on the same board: it can't move into in_sprint or done until that "
+        "story is done. Refused if it would make a story wait on itself, directly or through other stories. "
+        "Adding a dependency that exists already changes nothing. A human-only story can't be changed by an agent. "
+        "story: the story that waits, ID or key (e.g. 'FLW-12'). "
+        "blocker: the story it waits on, ID or key (e.g. 'FLW-3'). "
+        "note: required — why it needs that story first."
+    ),
+)
+def add_blocker(story: str, blocker: str, note: Note, ctx: Context) -> StoredStoryOut:
+    note = _require_note(note)
+    s = _resolve_story(story)
+    _refuse_human_only(s)
+    b = _resolve_story(blocker)
+    if b.board_id != s.board_id:
+        raise ToolError(f"{b.key} is not on the same board as {s.key}; a story can only wait on stories on its board.")
+    try:
+        updated = story_store.add_blocker(s.id, b.id, actor=_actor(ctx, note))
+    except (story_store.DependencyCycleError, story_store.HumanOnlyError) as exc:
+        raise ToolError(str(exc)) from exc
+    except story_store.BlockerNotFoundError:
+        raise ToolError(f"Story not found on the board of {s.key}: {blocker!r}.")
+    if updated is None:
+        raise ToolError(f"Story not found: {story!r}.")
+    return _out(updated)
+
+
+@_server.tool(
+    annotations=_WRITE_IDEMPOTENT,
+    description=(
+        "Stop a story waiting on another story. Removing a dependency that does not exist changes nothing. "
+        "A human-only story can't be changed by an agent. "
+        "story: the story that waits, ID or key (e.g. 'FLW-12'). "
+        "blocker: the story it no longer waits on, ID or key (e.g. 'FLW-3'). "
+        "note: required — why it no longer needs that story first."
+    ),
+)
+def remove_blocker(story: str, blocker: str, note: Note, ctx: Context) -> StoredStoryOut:
+    note = _require_note(note)
+    s = _resolve_story(story)
+    _refuse_human_only(s)
+    b = _resolve_story(blocker)
+    try:
+        updated = story_store.remove_blocker(s.id, b.id, actor=_actor(ctx, note))
+    except story_store.HumanOnlyError as exc:
+        raise ToolError(str(exc)) from exc
+    if updated is None:
+        raise ToolError(f"Story not found: {story!r}.")
+    return _out(updated)
+
+
 class EvidenceItem(BaseModel):
     path: str | None = Field(
         None, description="Absolute path of a local file: a test report (.html .xml .json .txt .log .pdf) or a "
@@ -535,6 +628,7 @@ def _upload_paths(story_id: str, evidence: DoneEvidenceIn, saved: list[str], act
         "blocked_reason: required when moving to 'blocked'; not allowed otherwise. "
         "A story whose latest verdict is discuss or needs_refinement can only move to backlog or refinement "
         "until it is assessed again. "
+        "A story can't move into in_sprint or done while a story it waits on (blocked_by) is not done. "
         "done_evidence: required when moving INTO 'done'; not allowed otherwise. Test reports and "
         "screenshots/recordings are absolute local file paths (uploaded for you) or URLs. "
         "A human-only story can't be moved by an agent. "
@@ -587,7 +681,9 @@ def move_story(
             done_evidence=evidence.model_dump() if evidence is not None else None,
             actor=_actor(ctx, note),
         )
-    except (story_store.EvidenceError, story_store.ReadinessError, story_store.HumanOnlyError) as exc:
+    except (
+        story_store.EvidenceError, story_store.ReadinessError, story_store.BlockersOpenError, story_store.HumanOnlyError
+    ) as exc:
         _discard(saved)
         raise ToolError(str(exc)) from exc
     except BaseException:
@@ -614,7 +710,7 @@ def _discard(file_ids: list[str]) -> None:
         "note: required — why you are assessing this story (e.g. 'Checking readiness before sprint planning')."
     ),
 )
-async def assess_story(story: str, note: Note, ctx: Context) -> StoredStoryDetailOut:
+async def assess_story(story: str, note: Note, ctx: Context) -> StoryDetailMcpOut:
     note = _require_note(note)
     s = _resolve_story(story)
     _refuse_human_only(s)  # before paying for a Jev call

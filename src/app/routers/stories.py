@@ -16,6 +16,8 @@ from starlette.concurrency import run_in_threadpool
 from app import engine, story_store
 from app.jev_client import JevError
 from app.routers.errors import (
+    blocker_invalid,
+    blockers_open,
     board_full,
     board_not_found,
     evidence_attached,
@@ -32,6 +34,7 @@ from app.schemas import (
     ActivityOut,
     AssessmentSummaryOut,
     AssessRequest,
+    BlockerIn,
     ErrorOut,
     EvidenceFileOut,
     HumanOnlyIn,
@@ -41,8 +44,9 @@ from app.schemas import (
     StoryCreateIn,
     StoryIn,
     StoryMoveIn,
+    StoryRefOut,
 )
-from app.story_store import Assessment, StoredStory
+from app.story_store import Assessment, StoredStory, StoryRef
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +84,10 @@ def _activity_out(entry: story_store.ActivityEntry) -> ActivityOut:
     )
 
 
+def _ref(ref: StoryRef) -> StoryRefOut:
+    return StoryRefOut(id=ref.id, key=ref.key, title=ref.title, status=ref.status)
+
+
 def _fields(story: StoredStory, recent: list[Assessment], agents: list[str] | None = None) -> dict:
     """Output fields shared by the list and detail views; *recent* is newest first."""
     latest = recent[0] if recent else None
@@ -104,6 +112,8 @@ def _fields(story: StoredStory, recent: list[Assessment], agents: list[str] | No
         "parent_id": story.parent_id,
         "parent_key": story.parent_key,
         "tags": story.tags,
+        "blocked_by": [_ref(r) for r in story.blocked_by],
+        "blocks": [_ref(r) for r in story.blocks],
     }
 
 
@@ -234,7 +244,8 @@ def update_story(story_id: str, body: StoryIn) -> StoredStoryOut | JSONResponse:
         "Entering the done column requires done_evidence (test reports, UI evidence for UI changes, commits); "
         "it is recorded in the story's activity. "
         "While the latest assessment's verdict is discuss or needs_refinement (even if stale), the story can only "
-        "move to backlog or refinement, or within its current column, until it is assessed again."
+        "move to backlog or refinement, or within its current column, until it is assessed again. "
+        "A story can't enter in_sprint or done while a story it waits on (blocked_by) is not done."
     ),
     responses=_NOT_FOUND,
 )
@@ -247,6 +258,8 @@ def move_story(story_id: str, body: StoryMoveIn) -> StoredStoryOut | JSONRespons
         )
     except story_store.ReadinessError as exc:
         return status_not_allowed(str(exc))
+    except story_store.BlockersOpenError as exc:
+        return blockers_open(str(exc))
     except story_store.EvidenceError as exc:
         return evidence_invalid(str(exc))
     if story is None:
@@ -274,6 +287,51 @@ def set_human_only(story_id: str, body: HumanOnlyIn) -> StoredStoryOut | JSONRes
     recent = story_store.list_assessments(story_id)[:2]
     agents_map = story_store.agents_by_story(story.board_id)
     return StoredStoryOut(**_fields(story, recent, agents_map.get(story_id, [])))
+
+
+@router.post(
+    "/stories/{story_id}/blockers",
+    response_model=StoredStoryOut,
+    operation_id="addStoryBlocker",
+    summary="Make a stored story wait on another story on its board",
+    description=(
+        "The story can't enter in_sprint or done until the story it waits on is done; it can still move anywhere "
+        "else. Both stories must be on the same board, and a story can't wait on itself, directly or through other "
+        "stories. Adding a dependency that exists already changes nothing. Does not mark the story stale."
+    ),
+    responses=_NOT_FOUND,
+)
+def add_blocker(story_id: str, body: BlockerIn) -> StoredStoryOut | JSONResponse:
+    try:
+        story = story_store.add_blocker(story_id, body.blocker_id)
+    except story_store.BlockerNotFoundError:
+        return blocker_invalid("The story to wait on was not found on this board.")
+    except story_store.DependencyCycleError as exc:
+        return blocker_invalid(str(exc), "dependency_cycle")
+    if story is None:
+        return _not_found()
+    return _out(story)
+
+
+@router.delete(
+    "/stories/{story_id}/blockers/{blocker_id}",
+    response_model=StoredStoryOut,
+    operation_id="removeStoryBlocker",
+    summary="Stop a stored story waiting on another story",
+    description="Removing a dependency that does not exist changes nothing.",
+    responses=_NOT_FOUND,
+)
+def remove_blocker(story_id: str, blocker_id: str) -> StoredStoryOut | JSONResponse:
+    story = story_store.remove_blocker(story_id, blocker_id)
+    if story is None:
+        return _not_found()
+    return _out(story)
+
+
+def _out(story: StoredStory) -> StoredStoryOut:
+    recent = story_store.list_assessments(story.id)[:2]
+    agents_map = story_store.agents_by_story(story.board_id)
+    return StoredStoryOut(**_fields(story, recent, agents_map.get(story.id, [])))
 
 
 @router.post(
